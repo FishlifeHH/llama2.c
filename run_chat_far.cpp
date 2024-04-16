@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <x86intrin.h>
 #if defined _WIN32
 #include "win.h"
 #else
@@ -79,16 +80,28 @@ typedef struct {
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->q = calloc(p->dim, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
+    s->x = static_cast<float*>(
+        calloc(p->dim, sizeof(float)));  // 16K for llama-7b-chat
+    s->xb = static_cast<float*>(
+        calloc(p->dim, sizeof(float)));  // 16K for llama-7b-chat
+    s->xb2 = static_cast<float*>(
+        calloc(p->dim, sizeof(float)));  // 16K for llama-7b-chat
+    s->hb = static_cast<float*>(
+        calloc(p->hidden_dim, sizeof(float)));  // 43K for llama-7b-chat
+    s->hb2 = static_cast<float*>(
+        calloc(p->hidden_dim, sizeof(float)));  // 43K for llama-7b-chat
+    s->q = static_cast<float*>(
+        calloc(p->dim, sizeof(float)));  // 16K for llama-7b-chat
+    s->key_cache =
+        static_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim,
+                                   sizeof(float)));  // 1G for llama-7b-chat
+    s->value_cache =
+        static_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim,
+                                   sizeof(float)));  // 1G for llama-7b-chat
+    s->att = static_cast<float*>(calloc(
+        p->n_heads * p->seq_len, sizeof(float)));  // 256K for llama-7b-chat
+    s->logits = static_cast<float*>(
+        calloc(p->vocab_size, sizeof(float)));  // 125K for llama-7b-chat
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
         !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -116,36 +129,36 @@ void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
     // make sure the multiplications below are done in 64bit to fit the
     // parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
-    w->token_embedding_table = ptr;
+    w->token_embedding_table = ptr;  // 125M for llama-7b-chat
     ptr += p->vocab_size * p->dim;
-    w->rms_att_weight = ptr;
+    w->rms_att_weight = ptr;  // 128K for llama-7b-chat
     ptr += n_layers * p->dim;
-    w->wq = ptr;
+    w->wq = ptr;  // 512M for llama-7b-chat
     ptr += n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;
+    w->wk = ptr;  // 512M for llama-7b-chat
     ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;
+    w->wv = ptr;  // 512M for llama-7b-chat
     ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;
+    w->wo = ptr;  // 512M for llama-7b-chat
     ptr += n_layers * (p->n_heads * head_size) * p->dim;
-    w->rms_ffn_weight = ptr;
+    w->rms_ffn_weight = ptr;  // 128K for llama-7b-chat
     ptr += n_layers * p->dim;
-    w->w1 = ptr;
+    w->w1 = ptr;  // 1376M for llama-7b-chat
     ptr += n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;
+    w->w2 = ptr;  // 1376M for llama-7b-chat
     ptr += n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
+    w->w3 = ptr;  // 1376M for llama-7b-chat
     ptr += n_layers * p->dim * p->hidden_dim;
-    w->rms_final_weight = ptr;
+    w->rms_final_weight = ptr;  // 4K for llama-7b-chat
     ptr += p->dim;
-    ptr += p->seq_len * head_size /
-           2;  // skip what used to be freq_cis_real (for RoPE)
-    ptr += p->seq_len * head_size /
-           2;  // skip what used to be freq_cis_imag (for RoPE)
+    ptr += p->seq_len * head_size / 2;  // skip what used to be freq_cis_real
+                                        // (for RoPE) // 128K for llama-7b-chat
+    ptr += p->seq_len * head_size / 2;  // skip what used to be freq_cis_imag
+                                        // (for RoPE) // 128K for llama-7b-chat
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
-void read_checkpoint(char* checkpoint, Config* config,
+void read_checkpoint(const char* checkpoint, Config* config,
                      TransformerWeights* weights, int* fd, float** data,
                      ssize_t* file_size) {
     FILE* file = fopen(checkpoint, "rb");
@@ -171,7 +184,8 @@ void read_checkpoint(char* checkpoint, Config* config,
         fprintf(stderr, "open failed!\n");
         exit(EXIT_FAILURE);
     }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    *data = static_cast<float*>(
+        mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
     if (*data == MAP_FAILED) {
         fprintf(stderr, "mmap failed!\n");
         exit(EXIT_FAILURE);
@@ -180,7 +194,7 @@ void read_checkpoint(char* checkpoint, Config* config,
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
-void build_transformer(Transformer* t, char* checkpoint_path) {
+void build_transformer(Transformer* t, const char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data,
                     &t->file_size);
@@ -389,7 +403,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, x, w->wcls, p->dim,
+           p->vocab_size);  // wcls size = p->dim * p->vocab_size = 125M
     return s->logits;
 }
 
@@ -397,7 +412,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
 typedef struct {
-    char* str;
+    const char* str;
     int id;
 } TokenIndex;
 
@@ -414,13 +429,15 @@ int compare_tokens(const void* a, const void* b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
+void build_tokenizer(Tokenizer* t, const char* tokenizer_path, int vocab_size) {
     // i should have written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
     // malloc space to hold the scores and the strings
-    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
-    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
-    t->sorted_vocab = NULL;  // initialized lazily
+    t->vocab =
+        (char**)malloc(vocab_size * sizeof(char*));  // 31K for llama-7b-chat
+    t->vocab_scores =
+        (float*)malloc(vocab_size * sizeof(float));  // 125K for llama-7b-chat
+    t->sorted_vocab = NULL;                          // initialized lazily
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
         t->byte_pieces[i * 2 + 1] = '\0';
@@ -499,12 +516,12 @@ void safe_printf(char* piece) {
     printf("%s", piece);
 }
 
-int str_lookup(char* str, TokenIndex* sorted_vocab, int vocab_size) {
+int str_lookup(const char* str, TokenIndex* sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or
     // -1 if not found
     TokenIndex tok = {.str = str};  // acts as the key to search for
-    TokenIndex* res = bsearch(&tok, sorted_vocab, vocab_size,
-                              sizeof(TokenIndex), compare_tokens);
+    TokenIndex* res = static_cast<TokenIndex*>(bsearch(
+        &tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens));
     return res != NULL ? res->id : -1;
 }
 
@@ -520,7 +537,8 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        t->sorted_vocab = static_cast<TokenIndex*>(malloc(
+            t->vocab_size * sizeof(TokenIndex)));  // 500K for llama-7b-chat
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
@@ -532,7 +550,8 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
     // create a temporary buffer that will store merge candidates of always two
     // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
     // case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+    char* str_buffer = static_cast<char*>(
+        malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char)));
     size_t str_len = 0;
 
     // start at 0 tokens
@@ -746,7 +765,8 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature,
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    sampler->probindex = static_cast<ProbIndex*>(malloc(
+        sampler->vocab_size * sizeof(ProbIndex)));  // 125K for llama-7b-chat
 }
 
 void free_sampler(Sampler* sampler) { free(sampler->probindex); }
@@ -943,9 +963,12 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                 char user_template[] = "[INST] %s [/INST]";
                 sprintf(rendered_prompt, user_template, user_prompt);
             }
+            auto start = __rdtsc();
             // encode the rendered prompt into tokens
             encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens,
                    &num_prompt_tokens);
+            auto end = __rdtsc();
+            printf("encode: %llu\n", end - start);
             user_idx = 0;  // reset the user index
             user_turn = 0;
             printf("Assistant: ");
@@ -1011,7 +1034,7 @@ void error_usage() {
 int main(int argc, char* argv[]) {
     // default parameters
     char* checkpoint_path = NULL;  // e.g. out/model.bin
-    char* tokenizer_path = "tokenizer.bin";
+    const char* tokenizer_path = "tokenizer.bin";
     float temperature =
         1.0f;  // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;  // top-p in nucleus sampling. 1.0 = off. 0.9 works well,
@@ -1019,7 +1042,7 @@ int main(int argc, char* argv[]) {
     int steps = 256;    // number of steps to run for
     char* prompt = NULL;              // prompt string
     unsigned long long rng_seed = 0;  // seed rng with time by default
-    char* mode = "generate";          // generate|chat
+    const char* mode = "generate";    // generate|chat
     char* system_prompt =
         NULL;  // the (optional) system prompt to use in chat mode
 

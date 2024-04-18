@@ -26,7 +26,7 @@
 #include <unistd.h>
 #endif
 
-#define STANDALONE
+// #define STANDALONE
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -669,7 +669,6 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // final rmsnorm
     rmsnorm(x, x, w->rms_final_weight, 0, dim);
-
     // classifier into logits
     matmul(s->logits, x, w->wcls, 0, p->dim,
            p->vocab_size);  // wcls size = p->dim * p->vocab_size = 125M
@@ -1197,6 +1196,8 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     int token;  // stores the current token to feed into the transformer
     int prev_token;
     int pos = 0;  // position in the sequence
+    size_t assistant_t = 0;
+    size_t assistant_tokens = 0;
     while (pos < steps) {
         // when it is the user's turn to contribute tokens to the dialog...
         if (user_turn) {
@@ -1221,6 +1222,9 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                 // otherwise get user prompt from stdin
                 read_stdin("User: ", user_prompt, sizeof(user_prompt));
             }
+            if (!strcmp(user_prompt, "<end>")) {
+                break;
+            }
             // render user/system prompts into the Llama 2 Chat schema
             if (pos == 0 && system_prompt[0] != '\0') {
                 char system_template[] =
@@ -1231,17 +1235,18 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                 char user_template[] = "[INST] %s [/INST]";
                 sprintf(rendered_prompt, user_template, user_prompt);
             }
-            auto start = __rdtsc();
+            auto start = get_cycles();
             // encode the rendered prompt into tokens
             encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens,
                    &num_prompt_tokens);
-            auto end = __rdtsc();
-            printf("encode: %llu\n", end - start);
+            auto end = get_cycles();
+            // printf("encode: %lu\n", end - start);
+            assistant_t += end - start;
             user_idx = 0;  // reset the user index
             user_turn = 0;
             printf("Assistant: ");
         }
-
+        auto start = get_cycles();
         // determine the token to pass into the transformer next
         if (user_idx < num_prompt_tokens) {
             // if we are still processing the input prompt, force the next
@@ -1251,19 +1256,29 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
             // otherwise use the next token sampled from previous turn
             token = next;
         }
+        assistant_tokens++;
         // EOS (=2) token ends the Assistant turn
         if (token == 2) {
             user_turn = 1;
         }
 
         // forward the transformer to get logits for the next token
+        auto fstart = get_cycles();
         float* logits = forward(transformer, token, pos);
+        auto fend = get_cycles();
+        // printf("forward: %lu\n", fend - fstart);
+        auto sstart = get_cycles();
         next = sample(sampler, logits);
+        auto send = get_cycles();
+        // printf("sample: %lu\n", send - sstart);
         pos++;
 
         if (user_idx >= num_prompt_tokens && next != 2) {
             // the Assistant is responding, so print its output
+            auto dstart = get_cycles();
             char* piece = decode(tokenizer, token, next);
+            auto dend = get_cycles();
+            // printf("decode: %lu\n", dend - dstart);
             safe_printf(piece);  // same as printf("%s", piece), but skips
                                  // "unsafe" bytes
             fflush(stdout);
@@ -1271,8 +1286,13 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
         if (next == 2) {
             printf("\n");
         }
+        auto end = get_cycles();
+        assistant_t += end - start;
     }
     printf("\n");
+    printf("achieved tok/s: %lf\n",
+           static_cast<double>(assistant_tokens) /
+               (static_cast<double>(assistant_t) / 2.8 / 1e9));
     free(prompt_tokens);
 }
 
@@ -1306,7 +1326,7 @@ int main(int argc, char* argv[]) {
     config.server_addr = "127.0.0.1";
     config.server_port = "50000";
     config.server_buffer_size = 1024L * 1024 * 1024 * 32;
-    config.client_buffer_size = 1024L * 1024 * 4;
+    config.client_buffer_size = 1024L * 1024 * 1024 * 8;
     config.evict_batch_size = 64 * 1024;
     config.max_thread_cnt = 8;
     Server server(config);
@@ -1316,68 +1336,74 @@ int main(int argc, char* argv[]) {
     constexpr size_t FAR_ARGC = 1;
     config.from_file(argv[1]);
 #endif
-    FarLib::runtime_init(config);
-    {
-        // default parameters
-        char* checkpoint_path = NULL;  // e.g. out/model.bin
-        const char* tokenizer_path = "tokenizer.bin";
-        float temperature = 1.0f;  // 0.0 = greedy deterministic. 1.0 =
-                                   // original. don't set higher
-        float topp = 0.9f;    // top-p in nucleus sampling. 1.0 = off. 0.9 works
-                              // well, but slower
-        int steps = 256;      // number of steps to run for
-        char* prompt = NULL;  // prompt string
-        unsigned long long rng_seed = 1;  // seed rng with time by default
-        const char* mode = "generate";    // generate|chat
-        char* system_prompt =
-            NULL;  // the (optional) system prompt to use in chat mode
+    // default parameters
+    char* checkpoint_path = NULL;  // e.g. out/model.bin
+    const char* tokenizer_path = "tokenizer.bin";
+    float temperature = 1.0f;  // 0.0 = greedy deterministic. 1.0 =
+                               // original. don't set higher
+    float topp = 0.9f;    // top-p in nucleus sampling. 1.0 = off. 0.9 works
+                          // well, but slower
+    int steps = 256;      // number of steps to run for
+    char* prompt = NULL;  // prompt string
+    unsigned long long rng_seed = 1;  // seed rng with time by default
+    const char* mode = "generate";    // generate|chat
+    char* system_prompt =
+        NULL;  // the (optional) system prompt to use in chat mode
 
-        // poor man's C argparse so we can override the defaults above from the
-        // command line
-        if (argc >= 2 + FAR_ARGC) {
-            checkpoint_path = argv[1 + FAR_ARGC];
+    // poor man's C argparse so we can override the defaults above from the
+    // command line
+    if (argc >= 2 + FAR_ARGC) {
+        checkpoint_path = argv[1 + FAR_ARGC];
+    } else {
+        error_usage();
+    }
+    for (int i = 2 + FAR_ARGC; i < argc; i += 2) {
+        // do some basic validation
+        if (i + 1 >= argc) {
+            error_usage();
+        }  // must have arg after flag
+        if (argv[i][0] != '-') {
+            error_usage();
+        }  // must start with dash
+        if (strlen(argv[i]) != 2) {
+            error_usage();
+        }  // must be -x (one dash, one letter)
+        // read in the args
+        if (argv[i][1] == 't') {
+            temperature = atof(argv[i + 1]);
+        } else if (argv[i][1] == 'p') {
+            topp = atof(argv[i + 1]);
+        } else if (argv[i][1] == 's') {
+            rng_seed = atoi(argv[i + 1]);
+        } else if (argv[i][1] == 'n') {
+            steps = atoi(argv[i + 1]);
+        } else if (argv[i][1] == 'i') {
+            prompt = argv[i + 1];
+        } else if (argv[i][1] == 'z') {
+            tokenizer_path = argv[i + 1];
+        } else if (argv[i][1] == 'm') {
+            mode = argv[i + 1];
+        } else if (argv[i][1] == 'y') {
+            system_prompt = argv[i + 1];
+        } else if (argv[i][1] == 'b') {
+            config.client_buffer_size = std::stoul(argv[i + 1]);
         } else {
             error_usage();
         }
-        for (int i = 2 + FAR_ARGC; i < argc; i += 2) {
-            // do some basic validation
-            if (i + 1 >= argc) {
-                error_usage();
-            }  // must have arg after flag
-            if (argv[i][0] != '-') {
-                error_usage();
-            }  // must start with dash
-            if (strlen(argv[i]) != 2) {
-                error_usage();
-            }  // must be -x (one dash, one letter)
-            // read in the args
-            if (argv[i][1] == 't') {
-                temperature = atof(argv[i + 1]);
-            } else if (argv[i][1] == 'p') {
-                topp = atof(argv[i + 1]);
-            } else if (argv[i][1] == 's') {
-                rng_seed = atoi(argv[i + 1]);
-            } else if (argv[i][1] == 'n') {
-                steps = atoi(argv[i + 1]);
-            } else if (argv[i][1] == 'i') {
-                prompt = argv[i + 1];
-            } else if (argv[i][1] == 'z') {
-                tokenizer_path = argv[i + 1];
-            } else if (argv[i][1] == 'm') {
-                mode = argv[i + 1];
-            } else if (argv[i][1] == 'y') {
-                system_prompt = argv[i + 1];
-            } else {
-                error_usage();
-            }
-        }
+    }
 
-        // parameter validation/overrides
-        if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
-        if (temperature < 0.0) temperature = 0.0;
-        if (topp < 0.0 || 1.0 < topp) topp = 0.9;
-        if (steps < 0) steps = 0;
-
+    // parameter validation/overrides
+    if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
+    if (temperature < 0.0) temperature = 0.0;
+    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
+    if (steps < 0) steps = 0;
+    std::cout << "llama init: " << std::endl;
+    std::cout << "client buffer size: "
+              << static_cast<double>(config.client_buffer_size) / (1 << 30)
+              << "G" << std::endl;
+    std::cout << "core count: " << config.max_thread_cnt << std::endl;
+    FarLib::runtime_init(config);
+    {
         // build the Transformer via the model .bin file
         Transformer transformer;
         build_transformer(&transformer, checkpoint_path);

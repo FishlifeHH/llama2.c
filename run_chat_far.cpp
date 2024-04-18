@@ -8,15 +8,31 @@
 #include <string.h>
 #include <time.h>
 #include <x86intrin.h>
+
+#include <chrono>
+#include <thread>
+
+#include "cache/accessor.hpp"
+#include "data_structure/far_vector.hpp"
+#include "rdma/client.hpp"
+#include "rdma/server.hpp"
+#include "utils/control.hpp"
+#include "utils/debug.hpp"
+#include "utils/parallel.hpp"
 #if defined _WIN32
 #include "win.h"
 #else
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+
+#define STANDALONE
 // ----------------------------------------------------------------------------
 // Transformer model
 
+using namespace FarLib;
+using namespace FarLib::rdma;
+using namespace std::chrono_literals;
 typedef struct {
     int dim;         // transformer dimension
     int hidden_dim;  // for ffn layers
@@ -28,26 +44,41 @@ typedef struct {
     int seq_len;     // max sequence length
 } Config;
 
-typedef struct {
+struct TransformerWeights {
     // token embedding table
-    float* token_embedding_table;  // (vocab_size, dim)
+    FarVector<float> token_embedding_table;  // (vocab_size, dim)
     // weights for rmsnorms
-    float* rms_att_weight;  // (layer, dim) rmsnorm weights
-    float* rms_ffn_weight;  // (layer, dim)
+    FarVector<float> rms_att_weight;  // (layer, dim) rmsnorm weights
+    FarVector<float> rms_ffn_weight;  // (layer, dim)
     // weights for matmuls. note dim == n_heads * head_size
-    float* wq;  // (layer, dim, n_heads * head_size)
-    float* wk;  // (layer, dim, n_kv_heads * head_size)
-    float* wv;  // (layer, dim, n_kv_heads * head_size)
-    float* wo;  // (layer, n_heads * head_size, dim)
+    FarVector<float> wq;  // (layer, dim, n_heads * head_size)
+    FarVector<float> wk;  // (layer, dim, n_kv_heads * head_size)
+    FarVector<float> wv;  // (layer, dim, n_kv_heads * head_size)
+    FarVector<float> wo;  // (layer, n_heads * head_size, dim)
     // weights for ffn
-    float* w1;  // (layer, hidden_dim, dim)
-    float* w2;  // (layer, dim, hidden_dim)
-    float* w3;  // (layer, hidden_dim, dim)
+    FarVector<float> w1;  // (layer, hidden_dim, dim)
+    FarVector<float> w2;  // (layer, dim, hidden_dim)
+    FarVector<float> w3;  // (layer, hidden_dim, dim)
     // final rmsnorm
-    float* rms_final_weight;  // (dim,)
+    FarVector<float> rms_final_weight;  // (dim,)
     // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
-} TransformerWeights;
+    FarVector<float> wcls;
+
+    void free() {
+        token_embedding_table.clear();
+        rms_att_weight.clear();
+        rms_ffn_weight.clear();
+        wq.clear();
+        wk.clear();
+        wv.clear();
+        wo.clear();
+        w1.clear();
+        w2.clear();
+        w3.clear();
+        rms_final_weight.clear();
+        wcls.clear();
+    }
+};
 
 typedef struct {
     // current wave of activations
@@ -57,13 +88,11 @@ typedef struct {
     float* hb;      // buffer for hidden dimension in the ffn (hidden_dim,)
     float* hb2;     // buffer for hidden dimension in the ffn (hidden_dim,)
     float* q;       // query (dim,)
-    float* k;       // key (dim,)
-    float* v;       // value (dim,)
     float* att;     // buffer for scores/attention values (n_heads, seq_len)
     float* logits;  // output logits
     // kv cache
-    float* key_cache;    // (layer, seq_len, dim)
-    float* value_cache;  // (layer, seq_len, dim)
+    FarVector<float> key_cache;    // (layer, seq_len, dim)
+    FarVector<float> value_cache;  // (layer, seq_len, dim)
 } RunState;
 
 typedef struct {
@@ -92,19 +121,20 @@ void malloc_run_state(RunState* s, Config* p) {
         calloc(p->hidden_dim, sizeof(float)));  // 43K for llama-7b-chat
     s->q = static_cast<float*>(
         calloc(p->dim, sizeof(float)));  // 16K for llama-7b-chat
-    s->key_cache =
-        static_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim,
-                                   sizeof(float)));  // 1G for llama-7b-chat
-    s->value_cache =
-        static_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim,
-                                   sizeof(float)));  // 1G for llama-7b-chat
+    const size_t key_cache_size =
+        p->n_layers * p->seq_len * kv_dim;  // 1G for llama-7b-chat
+    const size_t value_cache_size =
+        p->n_layers * p->seq_len * kv_dim;  // 1G for llama-7b-chat
+    s->key_cache.resize(key_cache_size);
+    s->value_cache.resize(value_cache_size);
     s->att = static_cast<float*>(calloc(
         p->n_heads * p->seq_len, sizeof(float)));  // 256K for llama-7b-chat
     s->logits = static_cast<float*>(
         calloc(p->vocab_size, sizeof(float)));  // 125K for llama-7b-chat
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
-        !s->key_cache || !s->value_cache || !s->att || !s->logits) {
+        s->key_cache.size() != key_cache_size ||
+        s->value_cache.size() != value_cache_size || !s->att || !s->logits) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -119,8 +149,8 @@ void free_run_state(RunState* s) {
     free(s->q);
     free(s->att);
     free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
+    s->key_cache.clear();
+    s->value_cache.clear();
 }
 
 void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
@@ -129,33 +159,57 @@ void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
     // make sure the multiplications below are done in 64bit to fit the
     // parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
-    w->token_embedding_table = ptr;  // 125M for llama-7b-chat
-    ptr += p->vocab_size * p->dim;
-    w->rms_att_weight = ptr;  // 128K for llama-7b-chat
-    ptr += n_layers * p->dim;
-    w->wq = ptr;  // 512M for llama-7b-chat
-    ptr += n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;  // 512M for llama-7b-chat
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;  // 512M for llama-7b-chat
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;  // 512M for llama-7b-chat
-    ptr += n_layers * (p->n_heads * head_size) * p->dim;
-    w->rms_ffn_weight = ptr;  // 128K for llama-7b-chat
-    ptr += n_layers * p->dim;
-    w->w1 = ptr;  // 1376M for llama-7b-chat
-    ptr += n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;  // 1376M for llama-7b-chat
-    ptr += n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;  // 1376M for llama-7b-chat
-    ptr += n_layers * p->dim * p->hidden_dim;
-    w->rms_final_weight = ptr;  // 4K for llama-7b-chat
-    ptr += p->dim;
-    ptr += p->seq_len * head_size / 2;  // skip what used to be freq_cis_real
-                                        // (for RoPE) // 128K for llama-7b-chat
-    ptr += p->seq_len * head_size / 2;  // skip what used to be freq_cis_imag
-                                        // (for RoPE) // 128K for llama-7b-chat
-    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+    const size_t token_embedding_table_size =
+        p->vocab_size * p->dim;  // 125M for llama-7b-chat
+    const size_t rms_att_weight_size =
+        n_layers * p->dim;  // 128K for llama-7b-chat
+    const size_t wq_size =
+        n_layers * p->dim * (p->n_heads * head_size);  // 512M for llama-7b-chat
+    const size_t wk_size =
+        n_layers * p->dim *
+        (p->n_kv_heads * head_size);  // 512M for llama-7b-chat
+    const size_t wv_size =
+        n_layers * p->dim *
+        (p->n_kv_heads * head_size);  // 512M for llama-7b-chat
+    const size_t wo_size =
+        n_layers * (p->n_heads * head_size) * p->dim;  // 512M for llama-7b-chat
+    const size_t rms_ffn_weight_size =
+        n_layers * p->dim;  // 128K for llama-7b-chat
+    const size_t w1_size =
+        n_layers * p->dim * p->hidden_dim;  // 1376M for llama-7b-chat
+    const size_t w2_size =
+        n_layers * p->hidden_dim * p->dim;  // 1376M for llama-7b-chat
+    const size_t w3_size =
+        n_layers * p->dim * p->hidden_dim;  // 1376M for llama-7b-chat
+    const size_t rms_final_weight_size =
+        p->dim + p->seq_len * head_size / 2 +
+        p->seq_len * head_size / 2;  // 4K + 128K + 128K for llama-7b-chat
+    const size_t wcls_size = p->dim * p->vocab_size;  // 125M for llama-7b-chat
+    float* token_embedding_table_ptr = ptr;
+    w->token_embedding_table.assign_all(ptr, token_embedding_table_size);
+    ptr += token_embedding_table_size;
+    w->rms_att_weight.assign_all(ptr, rms_att_weight_size);
+    ptr += rms_att_weight_size;
+    w->wq.assign_all(ptr, wq_size);
+    ptr += wq_size;
+    w->wk.assign_all(ptr, wk_size);
+    ptr += wk_size;
+    w->wv.assign_all(ptr, wv_size);
+    ptr += wv_size;
+    w->wo.assign_all(ptr, wo_size);
+    ptr += wo_size;
+    w->rms_ffn_weight.assign_all(ptr, rms_ffn_weight_size);
+    ptr += rms_ffn_weight_size;
+    w->w1.assign_all(ptr, w1_size);
+    ptr += w1_size;
+    w->w2.assign_all(ptr, w2_size);
+    ptr += w2_size;
+    w->w3.assign_all(ptr, w3_size);
+    ptr += w3_size;
+    w->rms_final_weight.assign_all(ptr, rms_final_weight_size);
+    ptr += rms_final_weight_size;
+    w->wcls.assign_all(shared_weights ? token_embedding_table_ptr : ptr,
+                       wcls_size);
 }
 
 void read_checkpoint(const char* checkpoint, Config* config,
@@ -207,6 +261,7 @@ void free_transformer(Transformer* t) {
     if (t->data != MAP_FAILED) {
         munmap(t->data, t->file_size);
     }
+    t->weights.free();
     if (t->fd != -1) {
         close(t->fd);
     }
@@ -230,6 +285,48 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
+}
+
+void rmsnorm(float* o, float* x, FarVector<float>& weight_fv, size_t start,
+             int size) {
+    // calculate sum of squares
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) {
+        ss += x[j] * x[j];
+    }
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    // normalize and scale
+    const size_t thread_cnt = uthread::get_worker_count();
+    const size_t block = (size + thread_cnt - 1) / thread_cnt;
+    uthread::parallel_for_with_scope<1>(
+        thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
+            using it_t = decltype(weight_fv.clbegin());
+            const size_t o_start = i * block;
+            const size_t o_end =
+                std::min(o_start + block, static_cast<size_t>(size));
+            const size_t idx_start = o_start + start;
+            const size_t idx_end = o_end + start;
+
+            if (idx_start >= idx_end) {
+                return;
+            }
+            struct Scope : public DereferenceScope {
+                it_t it;
+
+                void pin() const override { it.pin(); }
+
+                void unpin() const override { it.unpin(); }
+
+                Scope(DereferenceScope* scope) : DereferenceScope(scope) {}
+            } scp(&scope);
+            scp.it = weight_fv.get_const_lite_iter(idx_start, scp, idx_start,
+                                                   idx_end);
+            for (size_t oi = o_start; oi < o_end; oi++, scp.it.next(scp)) {
+                o[oi] = *(scp.it) * (ss * x[oi]);
+            }
+        });
 }
 
 void softmax(float* x, int size) {
@@ -266,6 +363,93 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+void matmul(float* xout, float* x, FarVector<float>& weight_fv, size_t wstart,
+            int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    const size_t thread_cnt = uthread::get_worker_count();
+    const size_t block = (d + thread_cnt - 1) / thread_cnt;
+    uthread::parallel_for_with_scope<1>(
+        thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
+            const size_t d_start = i * block;
+            const size_t d_end =
+                std::min(d_start + block, static_cast<size_t>(d));
+            const size_t idx_start = wstart + d_start * n;
+            const size_t idx_end = wstart + d_end * n;
+            if (d_start >= d_end) {
+                return;
+            }
+            using it_t = decltype(weight_fv.clbegin());
+            struct Scope : public DereferenceScope {
+                it_t it;
+
+                void pin() const override { it.pin(); }
+
+                void unpin() const override { it.unpin(); }
+
+                Scope(DereferenceScope* scope) : DereferenceScope(scope) {}
+            } scp(&scope);
+            scp.it = weight_fv.get_const_lite_iter(idx_start, scp, idx_start,
+                                                   idx_end);
+            for (size_t dd = d_start; dd < d_end; dd++) {
+                float val = 0.0f;
+                for (size_t j = 0; j < n; j++, scp.it.next(scp)) {
+                    val += *(scp.it) * x[j];
+                }
+                xout[dd] = val;
+            }
+        });
+}
+
+void matmul(FarVector<float>& xout_fv, size_t xout_start, float* x,
+            FarVector<float>& weight_fv, size_t wstart, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    const size_t thread_cnt = uthread::get_worker_count();
+    const size_t block = (d + thread_cnt - 1) / thread_cnt;
+    uthread::parallel_for_with_scope<1>(
+        thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
+            const size_t d_start = i * block;
+            const size_t d_end =
+                std::min(d_start + block, static_cast<size_t>(d));
+            const size_t out_start = xout_start + d_start;
+            const size_t out_end = xout_start + d_end;
+            if (d_start >= d_end) {
+                return;
+            }
+            using w_it_t = decltype(weight_fv.clbegin());
+            using out_it_t = decltype(xout_fv.lbegin());
+            struct Scope : public DereferenceScope {
+                w_it_t w_it;
+                out_it_t out_it;
+                void pin() const override {
+                    w_it.pin();
+                    out_it.pin();
+                }
+
+                void unpin() const override {
+                    w_it.unpin();
+                    out_it.unpin();
+                }
+
+                Scope(DereferenceScope* scope) : DereferenceScope(scope) {}
+            } scp(&scope);
+            scp.out_it =
+                xout_fv.get_lite_iter(out_start, scp, out_start, out_end);
+            for (size_t dd = d_start; dd < d_end; dd++, scp.out_it.next(scp)) {
+                float val = 0.0f;
+                const size_t idx_start = wstart + dd * n;
+                const size_t idx_end = wstart + (dd + 1) * n;
+                scp.w_it = weight_fv.get_const_lite_iter(idx_start, scp,
+                                                         idx_start, idx_end);
+                for (size_t j = 0; j < n; j++, scp.w_it.next(scp)) {
+                    val += *(scp.w_it) * x[j];
+                }
+                *(scp.out_it) = val;
+            }
+        });
+}
+
 float* forward(Transformer* transformer, int token, int pos) {
     // a few convenience variables
     Config* p = &transformer->config;
@@ -281,91 +465,175 @@ float* forward(Transformer* transformer, int token, int pos) {
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
-    float* content_row = w->token_embedding_table + token * dim;
-    memcpy(x, content_row, dim * sizeof(*x));
+    w->token_embedding_table.copy_to_local(x, token * dim, dim);
 
     // forward all the layers
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
+        rmsnorm(s->xb, x, w->rms_att_weight, l * dim, dim);
 
         // key and value point to the kv cache
         int loff =
             l * p->seq_len * kv_dim;  // kv cache layer offset for convenience
-        s->k = s->key_cache + loff + pos * kv_dim;
-        s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+        const size_t key_cache_start = loff + pos * kv_dim;
+        const size_t value_cache_start = loff + pos * kv_dim;
+        matmul(s->q, s->xb, w->wq, l * dim * dim, dim, dim);
+        matmul(s->key_cache, loff + pos * kv_dim, s->xb, w->wk,
+               l * dim * kv_dim, dim, kv_dim);
+        matmul(s->value_cache, loff + pos * kv_dim, s->xb, w->wv,
+               l * dim * kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in
         // each head
+        {
+            const int min_dim = std::min(dim, kv_dim);
+            const size_t thread_cnt = uthread::get_worker_count();
+            const size_t block = (min_dim / 2 + thread_cnt - 1) / thread_cnt;
+            uthread::parallel_for_with_scope<1>(
+                thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
+                    const int idx_start = i * block * 2;
+                    const int idx_end = std::min(
+                        min_dim, static_cast<int>(idx_start + block * 2));
+                    if (idx_start >= idx_end) {
+                        return;
+                    }
+                    using it_t = decltype(s->key_cache.lbegin());
+                    struct Scope : public DereferenceScope {
+                        it_t it;
+                        it_t it1;
+
+                        void pin() const override {
+                            it.pin();
+                            it1.pin();
+                        }
+
+                        void unpin() const override {
+                            it.unpin();
+                            it1.unpin();
+                        }
+
+                        void next2() {
+                            it.nextn(2, *this);
+                            it1.nextn(2, *this);
+                        }
+
+                        Scope(DereferenceScope* scope)
+                            : DereferenceScope(scope) {}
+                    } scp(&scope);
+                    scp.it = s->key_cache.get_lite_iter(
+                        key_cache_start + idx_start, scp,
+                        key_cache_start + idx_start, key_cache_start + idx_end);
+                    scp.it1 = s->key_cache.get_lite_iter(
+                        key_cache_start + idx_start + 1, scp,
+                        key_cache_start + idx_start, key_cache_start + idx_end);
+                    for (int i = idx_start; i < idx_end; i += 2, scp.next2()) {
+                        int head_dim = i % head_size;
+                        float freq =
+                            1.0f / powf(10000.0f, head_dim / (float)head_size);
+                        float val = pos * freq;
+                        float fcr = cosf(val);
+                        float fci = sinf(val);
+
+                        int rotn =
+                            2;  // how many vectors? 2 = q & k, 1 = q only
+                        float v0 = *(scp.it);
+                        float v1 = *(scp.it1);
+                        *(scp.it) = v0 * fcr - v1 * fci;
+                        *(scp.it1) = v0 * fci + v1 * fcr;
+                    }
+                });
+        }
+
         for (int i = 0; i < dim; i += 2) {
             int head_dim = i % head_size;
             float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
             float val = pos * freq;
             float fcr = cosf(val);
             float fci = sinf(val);
-            int rotn =
-                i < kv_dim ? 2 : 1;  // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0
-                                 ? s->q
-                                 : s->k;  // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i + 1];
-                vec[i] = v0 * fcr - v1 * fci;
-                vec[i + 1] = v0 * fci + v1 * fcr;
-            }
+
+            int rotn = 1;       // how many vectors? 2 = q & k, 1 = q only
+            float* vec = s->q;  // the vector to rotate (query or key)
+            float v0 = vec[i];
+            float v1 = vec[i + 1];
+            vec[i] = v0 * fcr - v1 * fci;
+            vec[i + 1] = v0 * fci + v1 * fcr;
         }
 
         // multihead attention. iterate over all heads
-        int h;
-#pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float* q = s->q + h * head_size;
-            // attention scores for this head
-            float* att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float* k =
-                    s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
+        const size_t thread_cnt = uthread::get_worker_count();
+        const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
+        uthread::parallel_for_with_scope<1>(
+            thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
+                const size_t h_start = i * block;
+                const size_t h_end =
+                    std::min(h_start + block, static_cast<size_t>(p->n_heads));
+                if (h_start >= h_end) {
+                    return;
                 }
-                score /= sqrtf(head_size);
-                // save the score to the attention buffer
-                att[t] = score;
-            }
+                for (size_t h = h_start; h < h_end; h++) {
+                    // get the query vector for this head
+                    float* q = s->q + h * head_size;
+                    // attention scores for this head
+                    float* att = s->att + h * p->seq_len;
+                    // iterate over all timesteps, including the current one
+                    using it_t = decltype(s->key_cache.clbegin());
+                    struct Scope : public DereferenceScope {
+                        it_t it;
 
-            // softmax the scores to get attention weights, from 0..pos
-            // inclusively
-            softmax(att, pos + 1);
+                        void pin() const override { it.pin(); }
 
-            // weighted sum of the values, store back into xb
-            float* xb = s->xb + h * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * kv_dim +
-                           (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
-                float a = att[t];
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
+                        void unpin() const override { it.unpin(); }
+
+                        Scope(DereferenceScope* scope)
+                            : DereferenceScope(scope) {}
+                    } scp(&scope);
+                    for (int t = 0; t <= pos; t++) {
+                        // get the key vector for this head and at this timestep
+                        const size_t key_cache_base =
+                            loff + t * kv_dim + (h / kv_mul) * head_size;
+                        scp.it = s->key_cache.get_const_lite_iter(
+                            key_cache_base, scp, key_cache_base,
+                            key_cache_base + head_size);
+                        // calculate the attention score as the dot
+                        // product of q and k
+                        float score = 0.0f;
+                        for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
+                            score += q[i] * (*(scp.it));
+                        }
+                        score /= sqrtf(head_size);
+                        // save the score to the attention buffer
+                        att[t] = score;
+                    }
+
+                    // softmax the scores to get attention weights, from 0..pos
+                    // inclusively
+                    softmax(att, pos + 1);
+
+                    // weighted sum of the values, store back into xb
+                    float* xb = s->xb + h * head_size;
+                    memset(xb, 0, head_size * sizeof(float));
+                    for (int t = 0; t <= pos; t++) {
+                        // get the value vector for this head and at this
+                        // timestep
+                        const size_t value_cache_base =
+                            loff + t * kv_dim + (h / kv_mul) * head_size;
+                        scp.it = s->value_cache.get_const_lite_iter(
+                            value_cache_base, scp, value_cache_base,
+                            value_cache_base + head_size);
+                        // get the attention weight for this timestep
+                        float a = att[t];
+                        // accumulate the weighted value into xb
+                        for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
+                            xb[i] += a * (*(scp.it));
+                        }
+                    }
                 }
-            }
-        }
+            });
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+        matmul(s->xb2, s->xb, w->wo, l * dim * dim, dim, dim);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -373,12 +641,12 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
+        rmsnorm(s->xb, x, w->rms_ffn_weight, l * dim, dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) *
         // self.w3(x)) first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s->hb, s->xb, w->w1, l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3, l * dim * hidden_dim, dim, hidden_dim);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -391,7 +659,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, w->w2, l * dim * hidden_dim, hidden_dim, dim);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -400,10 +668,10 @@ float* forward(Transformer* transformer, int token, int pos) {
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
+    rmsnorm(x, x, w->rms_final_weight, 0, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim,
+    matmul(s->logits, x, w->wcls, 0, p->dim,
            p->vocab_size);  // wcls size = p->dim * p->vocab_size = 125M
     return s->logits;
 }
@@ -1032,95 +1300,120 @@ void error_usage() {
 }
 
 int main(int argc, char* argv[]) {
-    // default parameters
-    char* checkpoint_path = NULL;  // e.g. out/model.bin
-    const char* tokenizer_path = "tokenizer.bin";
-    float temperature =
-        1.0f;  // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 0.9f;  // top-p in nucleus sampling. 1.0 = off. 0.9 works well,
-                        // but slower
-    int steps = 256;    // number of steps to run for
-    char* prompt = NULL;              // prompt string
-    unsigned long long rng_seed = 0;  // seed rng with time by default
-    const char* mode = "generate";    // generate|chat
-    char* system_prompt =
-        NULL;  // the (optional) system prompt to use in chat mode
+    Configure config;
+#ifdef STANDALONE
+    constexpr size_t FAR_ARGC = 0;
+    config.server_addr = "127.0.0.1";
+    config.server_port = "50000";
+    config.server_buffer_size = 1024L * 1024 * 1024 * 32;
+    config.client_buffer_size = 1024L * 1024 * 4;
+    config.evict_batch_size = 64 * 1024;
+    config.max_thread_cnt = 8;
+    Server server(config);
+    std::thread server_thread([&server] { server.start(); });
+    std::this_thread::sleep_for(1s);
+#else
+    constexpr size_t FAR_ARGC = 1;
+    config.from_file(argv[1]);
+#endif
+    FarLib::runtime_init(config);
+    {
+        // default parameters
+        char* checkpoint_path = NULL;  // e.g. out/model.bin
+        const char* tokenizer_path = "tokenizer.bin";
+        float temperature = 1.0f;  // 0.0 = greedy deterministic. 1.0 =
+                                   // original. don't set higher
+        float topp = 0.9f;    // top-p in nucleus sampling. 1.0 = off. 0.9 works
+                              // well, but slower
+        int steps = 256;      // number of steps to run for
+        char* prompt = NULL;  // prompt string
+        unsigned long long rng_seed = 1;  // seed rng with time by default
+        const char* mode = "generate";    // generate|chat
+        char* system_prompt =
+            NULL;  // the (optional) system prompt to use in chat mode
 
-    // poor man's C argparse so we can override the defaults above from the
-    // command line
-    if (argc >= 2) {
-        checkpoint_path = argv[1];
-    } else {
-        error_usage();
-    }
-    for (int i = 2; i < argc; i += 2) {
-        // do some basic validation
-        if (i + 1 >= argc) {
-            error_usage();
-        }  // must have arg after flag
-        if (argv[i][0] != '-') {
-            error_usage();
-        }  // must start with dash
-        if (strlen(argv[i]) != 2) {
-            error_usage();
-        }  // must be -x (one dash, one letter)
-        // read in the args
-        if (argv[i][1] == 't') {
-            temperature = atof(argv[i + 1]);
-        } else if (argv[i][1] == 'p') {
-            topp = atof(argv[i + 1]);
-        } else if (argv[i][1] == 's') {
-            rng_seed = atoi(argv[i + 1]);
-        } else if (argv[i][1] == 'n') {
-            steps = atoi(argv[i + 1]);
-        } else if (argv[i][1] == 'i') {
-            prompt = argv[i + 1];
-        } else if (argv[i][1] == 'z') {
-            tokenizer_path = argv[i + 1];
-        } else if (argv[i][1] == 'm') {
-            mode = argv[i + 1];
-        } else if (argv[i][1] == 'y') {
-            system_prompt = argv[i + 1];
+        // poor man's C argparse so we can override the defaults above from the
+        // command line
+        if (argc >= 2 + FAR_ARGC) {
+            checkpoint_path = argv[1 + FAR_ARGC];
         } else {
             error_usage();
         }
+        for (int i = 2 + FAR_ARGC; i < argc; i += 2) {
+            // do some basic validation
+            if (i + 1 >= argc) {
+                error_usage();
+            }  // must have arg after flag
+            if (argv[i][0] != '-') {
+                error_usage();
+            }  // must start with dash
+            if (strlen(argv[i]) != 2) {
+                error_usage();
+            }  // must be -x (one dash, one letter)
+            // read in the args
+            if (argv[i][1] == 't') {
+                temperature = atof(argv[i + 1]);
+            } else if (argv[i][1] == 'p') {
+                topp = atof(argv[i + 1]);
+            } else if (argv[i][1] == 's') {
+                rng_seed = atoi(argv[i + 1]);
+            } else if (argv[i][1] == 'n') {
+                steps = atoi(argv[i + 1]);
+            } else if (argv[i][1] == 'i') {
+                prompt = argv[i + 1];
+            } else if (argv[i][1] == 'z') {
+                tokenizer_path = argv[i + 1];
+            } else if (argv[i][1] == 'm') {
+                mode = argv[i + 1];
+            } else if (argv[i][1] == 'y') {
+                system_prompt = argv[i + 1];
+            } else {
+                error_usage();
+            }
+        }
+
+        // parameter validation/overrides
+        if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
+        if (temperature < 0.0) temperature = 0.0;
+        if (topp < 0.0 || 1.0 < topp) topp = 0.9;
+        if (steps < 0) steps = 0;
+
+        // build the Transformer via the model .bin file
+        Transformer transformer;
+        build_transformer(&transformer, checkpoint_path);
+        if (steps == 0 || steps > transformer.config.seq_len)
+            steps = transformer.config.seq_len;  // override to ~max length
+
+        // build the Tokenizer via the tokenizer .bin file
+        Tokenizer tokenizer;
+        build_tokenizer(&tokenizer, tokenizer_path,
+                        transformer.config.vocab_size);
+
+        // build the Sampler
+        Sampler sampler;
+        build_sampler(&sampler, transformer.config.vocab_size, temperature,
+                      topp, rng_seed);
+
+        // run!
+        if (strcmp(mode, "generate") == 0) {
+            generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        } else if (strcmp(mode, "chat") == 0) {
+            chat(&transformer, &tokenizer, &sampler, prompt, system_prompt,
+                 steps);
+        } else {
+            fprintf(stderr, "unknown mode: %s\n", mode);
+            error_usage();
+        }
+
+        // memory and file handles cleanup
+        free_sampler(&sampler);
+        free_tokenizer(&tokenizer);
+        free_transformer(&transformer);
     }
-
-    // parameter validation/overrides
-    if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
-    if (temperature < 0.0) temperature = 0.0;
-    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
-    if (steps < 0) steps = 0;
-
-    // build the Transformer via the model .bin file
-    Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
-    if (steps == 0 || steps > transformer.config.seq_len)
-        steps = transformer.config.seq_len;  // override to ~max length
-
-    // build the Tokenizer via the tokenizer .bin file
-    Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
-
-    // build the Sampler
-    Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
-                  rng_seed);
-
-    // run!
-    if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
-    } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
-    } else {
-        fprintf(stderr, "unknown mode: %s\n", mode);
-        error_usage();
-    }
-
-    // memory and file handles cleanup
-    free_sampler(&sampler);
-    free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
+    FarLib::runtime_destroy();
+#ifdef STANDALONE
+    server_thread.join();
+#endif
     return 0;
 }
 #endif

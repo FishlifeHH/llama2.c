@@ -1018,7 +1018,7 @@ int main(int argc, char* argv[]) {
                         // but slower
     int steps = 256;    // number of steps to run for
     char* prompt = NULL;              // prompt string
-    unsigned long long rng_seed = 0;  // seed rng with time by default
+    unsigned long long rng_seed = 1;  // seed rng with time by default
     char* mode = "generate";          // generate|chat
     char* system_prompt =
         NULL;  // the (optional) system prompt to use in chat mode

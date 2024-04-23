@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <x86intrin.h>
 #if defined _WIN32
 #include "win.h"
 #else
@@ -16,6 +17,11 @@
 // ----------------------------------------------------------------------------
 // Transformer model
 
+typedef unsigned long long Time_t;
+static Time_t get_cycles() {
+    unsigned int t;
+    return __rdtscp(&t);
+}
 typedef struct {
     int dim;         // transformer dimension
     int hidden_dim;  // for ffn layers
@@ -242,7 +248,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
-#pragma omp parallel for private(i)
+#pragma omp parallel for private(i) num_threads(16)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -309,7 +315,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // multihead attention. iterate over all heads
         int h;
-#pragma omp parallel for private(h)
+#pragma omp parallel for private(h) num_threads(16)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
             float* q = s->q + h * head_size;
@@ -909,6 +915,8 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     int token;  // stores the current token to feed into the transformer
     int prev_token;
     int pos = 0;  // position in the sequence
+    size_t assistant_t = 0;
+    size_t assistant_tokens = 0;
     while (pos < steps) {
         // when it is the user's turn to contribute tokens to the dialog...
         if (user_turn) {
@@ -933,6 +941,9 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                 // otherwise get user prompt from stdin
                 read_stdin("User: ", user_prompt, sizeof(user_prompt));
             }
+            if (!strcmp(user_prompt, "<end>")) {
+                break;
+            }
             // render user/system prompts into the Llama 2 Chat schema
             if (pos == 0 && system_prompt[0] != '\0') {
                 char system_template[] =
@@ -943,14 +954,17 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                 char user_template[] = "[INST] %s [/INST]";
                 sprintf(rendered_prompt, user_template, user_prompt);
             }
+            Time_t start = get_cycles();
             // encode the rendered prompt into tokens
             encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens,
                    &num_prompt_tokens);
+            Time_t end = get_cycles();
+            assistant_t += end - start;
             user_idx = 0;  // reset the user index
             user_turn = 0;
             printf("Assistant: ");
         }
-
+        Time_t start = get_cycles();
         // determine the token to pass into the transformer next
         if (user_idx < num_prompt_tokens) {
             // if we are still processing the input prompt, force the next
@@ -960,6 +974,7 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
             // otherwise use the next token sampled from previous turn
             token = next;
         }
+        assistant_tokens++;
         // EOS (=2) token ends the Assistant turn
         if (token == 2) {
             user_turn = 1;
@@ -980,8 +995,13 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
         if (next == 2) {
             printf("\n");
         }
+        Time_t end = get_cycles();
+        assistant_t += end - start;
     }
     printf("\n");
+    printf("achieved tok/s: %lf\n",
+           (double)assistant_tokens / (assistant_t / 2.8 / 1e9));
+
     free(prompt_tokens);
 }
 

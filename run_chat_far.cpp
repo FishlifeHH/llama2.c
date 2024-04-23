@@ -1,4 +1,7 @@
 /* Inference for Llama-2 Transformer model in pure C */
+extern "C" {
+#include <runtime/runtime.h>
+}
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -10,8 +13,13 @@
 #include <x86intrin.h>
 
 #include <chrono>
-#include <thread>
+#include <memory>
+#include <vector>
 
+#include "dataframe_vector.hpp"
+#include "deref_scope.hpp"
+#include "manager.hpp"
+#include "thread.h"
 #if defined _WIN32
 #include "win.h"
 #else
@@ -19,13 +27,23 @@
 #include <unistd.h>
 #endif
 
-#define STANDALONE
 // ----------------------------------------------------------------------------
 // Transformer model
 
-using namespace FarLib;
-using namespace FarLib::rdma;
+using namespace far_memory;
 using namespace std::chrono_literals;
+
+constexpr uint64_t kCacheGBs = 1;
+constexpr uint64_t kCacheSize = kCacheGBs << 30;
+constexpr uint64_t kFarMemSize = (1ULL << 30); // 1 GB. Not relevant here.
+constexpr uint64_t kNumGCThreads = 40;
+constexpr uint64_t kNumElementsPerScope = 1024;
+constexpr uint64_t kNumConnections = 400;
+
+static auto get_cycles() {
+  unsigned int t;
+  return __rdtscp(&t);
+}
 typedef struct {
   int dim;        // transformer dimension
   int hidden_dim; // for ffn layers
@@ -39,41 +57,46 @@ typedef struct {
 
 struct TransformerWeights {
   // token embedding table
-  FarVector<float> token_embedding_table; // (vocab_size, dim)
+  DataFrameVector<float> token_embedding_table; // (vocab_size, dim)
   // weights for rmsnorms
-  FarVector<float> rms_att_weight; // (layer, dim) rmsnorm weights
-  FarVector<float> rms_ffn_weight; // (layer, dim)
+  DataFrameVector<float> rms_att_weight; // (layer, dim) rmsnorm weights
+  DataFrameVector<float> rms_ffn_weight; // (layer, dim)
   // weights for matmuls. note dim == n_heads * head_size
-  FarVector<float> wq; // (layer, dim, n_heads * head_size)
-  FarVector<float> wk; // (layer, dim, n_kv_heads * head_size)
-  FarVector<float> wv; // (layer, dim, n_kv_heads * head_size)
-  FarVector<float> wo; // (layer, n_heads * head_size, dim)
+  DataFrameVector<float> wq; // (layer, dim, n_heads * head_size)
+  DataFrameVector<float> wk; // (layer, dim, n_kv_heads * head_size)
+  DataFrameVector<float> wv; // (layer, dim, n_kv_heads * head_size)
+  DataFrameVector<float> wo; // (layer, n_heads * head_size, dim)
   // weights for ffn
-  FarVector<float> w1; // (layer, hidden_dim, dim)
-  FarVector<float> w2; // (layer, dim, hidden_dim)
-  FarVector<float> w3; // (layer, hidden_dim, dim)
+  DataFrameVector<float> w1; // (layer, hidden_dim, dim)
+  DataFrameVector<float> w2; // (layer, dim, hidden_dim)
+  DataFrameVector<float> w3; // (layer, hidden_dim, dim)
   // final rmsnorm
-  FarVector<float> rms_final_weight; // (dim,)
+  DataFrameVector<float> rms_final_weight; // (dim,)
   // (optional) classifier weights for the logits, on the last layer
-  FarVector<float> wcls;
+  DataFrameVector<float> wcls;
+  TransformerWeights(FarMemManager *manager)
+      : token_embedding_table(manager), rms_att_weight(manager),
+        rms_ffn_weight(manager), wq(manager), wk(manager), wv(manager),
+        wo(manager), w1(manager), w2(manager), w3(manager),
+        rms_final_weight(manager), wcls(manager) {}
 
   void free() {
-    token_embedding_table.clear();
-    rms_att_weight.clear();
-    rms_ffn_weight.clear();
-    wq.clear();
-    wk.clear();
-    wv.clear();
-    wo.clear();
-    w1.clear();
-    w2.clear();
-    w3.clear();
-    rms_final_weight.clear();
-    wcls.clear();
+    // token_embedding_table.cleanup();
+    // rms_att_weight.cleanup();
+    // rms_ffn_weight.cleanup();
+    // wq.cleanup();
+    // wk.cleanup();
+    // wv.cleanup();
+    // wo.cleanup();
+    // w1.cleanup();
+    // w2.cleanup();
+    // w3.cleanup();
+    // rms_final_weight.cleanup();
+    // wcls.cleanup();
   }
 };
 
-typedef struct {
+struct RunState {
   // current wave of activations
   float *x;      // activation at current time stamp (dim,)
   float *xb;     // same, but inside a residual branch (dim,)
@@ -84,11 +107,15 @@ typedef struct {
   float *att;    // buffer for scores/attention values (n_heads, seq_len)
   float *logits; // output logits
   // kv cache
-  FarVector<float> key_cache;   // (layer, seq_len, dim)
-  FarVector<float> value_cache; // (layer, seq_len, dim)
-} RunState;
+  DataFrameVector<float> key_cache;   // (layer, seq_len, dim)
+  DataFrameVector<float> value_cache; // (layer, seq_len, dim)
 
-typedef struct {
+  RunState(FarMemManager *manager) : key_cache(manager), value_cache(manager) {}
+};
+
+static constexpr bool MULTITHREAD_ENABLE =
+    DataFrameVector<float>::MULTITHREAD_ENABLE;
+struct Transformer {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
   RunState state; // buffers for the "wave" of activations in the forward pass
@@ -96,7 +123,9 @@ typedef struct {
   int fd;            // file descriptor for memory mapping
   float *data;       // memory mapped data pointer
   ssize_t file_size; // size of the checkpoint file in bytes
-} Transformer;
+
+  Transformer(FarMemManager *manager) : state(manager), weights(manager) {}
+};
 
 void malloc_run_state(RunState *s, Config *p) {
   // we calloc instead of malloc to keep valgrind happy
@@ -141,8 +170,8 @@ void free_run_state(RunState *s) {
   free(s->q);
   free(s->att);
   free(s->logits);
-  s->key_cache.clear();
-  s->value_cache.clear();
+  // s->key_cache.cleanup();
+  // s->value_cache.cleanup();
 }
 
 void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
@@ -176,30 +205,30 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
       p->seq_len * head_size / 2; // 4K + 128K + 128K for llama-7b-chat
   const size_t wcls_size = p->dim * p->vocab_size; // 125M for llama-7b-chat
   float *token_embedding_table_ptr = ptr;
-  w->token_embedding_table.assign_all(ptr, token_embedding_table_size);
+  w->token_embedding_table.assign_locally(ptr, token_embedding_table_size);
   ptr += token_embedding_table_size;
-  w->rms_att_weight.assign_all(ptr, rms_att_weight_size);
+  w->rms_att_weight.assign_locally(ptr, rms_att_weight_size);
   ptr += rms_att_weight_size;
-  w->wq.assign_all(ptr, wq_size);
+  w->wq.assign_locally(ptr, wq_size);
   ptr += wq_size;
-  w->wk.assign_all(ptr, wk_size);
+  w->wk.assign_locally(ptr, wk_size);
   ptr += wk_size;
-  w->wv.assign_all(ptr, wv_size);
+  w->wv.assign_locally(ptr, wv_size);
   ptr += wv_size;
-  w->wo.assign_all(ptr, wo_size);
+  w->wo.assign_locally(ptr, wo_size);
   ptr += wo_size;
-  w->rms_ffn_weight.assign_all(ptr, rms_ffn_weight_size);
+  w->rms_ffn_weight.assign_locally(ptr, rms_ffn_weight_size);
   ptr += rms_ffn_weight_size;
-  w->w1.assign_all(ptr, w1_size);
+  w->w1.assign_locally(ptr, w1_size);
   ptr += w1_size;
-  w->w2.assign_all(ptr, w2_size);
+  w->w2.assign_locally(ptr, w2_size);
   ptr += w2_size;
-  w->w3.assign_all(ptr, w3_size);
+  w->w3.assign_locally(ptr, w3_size);
   ptr += w3_size;
-  w->rms_final_weight.assign_all(ptr, rms_final_weight_size);
+  w->rms_final_weight.assign_locally(ptr, rms_final_weight_size);
   ptr += rms_final_weight_size;
-  w->wcls.assign_all(shared_weights ? token_embedding_table_ptr : ptr,
-                     wcls_size);
+  w->wcls.assign_locally(shared_weights ? token_embedding_table_ptr : ptr,
+                         wcls_size);
 }
 
 void read_checkpoint(const char *checkpoint, Config *config,
@@ -238,12 +267,15 @@ void read_checkpoint(const char *checkpoint, Config *config,
   memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
-void build_transformer(Transformer *t, const char *checkpoint_path) {
+Transformer build_transformer(FarMemManager *manager,
+                              const char *checkpoint_path) {
   // read in the Config and the Weights from the checkpoint
-  read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data,
-                  &t->file_size);
+  Transformer t(manager);
+  read_checkpoint(checkpoint_path, &t.config, &t.weights, &t.fd, &t.data,
+                  &t.file_size);
   // allocate the RunState buffers
-  malloc_run_state(&t->state, &t->config);
+  malloc_run_state(&t.state, &t.config);
+  return t;
 }
 
 void free_transformer(Transformer *t) {
@@ -277,8 +309,8 @@ void rmsnorm(float *o, float *x, float *weight, int size) {
   }
 }
 
-void rmsnorm(float *o, float *x, FarVector<float> &weight_fv, size_t start,
-             int size) {
+void rmsnorm(float *o, float *x, DataFrameVector<float> &weight_fv,
+             size_t start, int size) {
   // calculate sum of squares
   float ss = 0.0f;
   for (int j = 0; j < size; j++) {
@@ -288,35 +320,32 @@ void rmsnorm(float *o, float *x, FarVector<float> &weight_fv, size_t start,
   ss += 1e-5f;
   ss = 1.0f / sqrtf(ss);
   // normalize and scale
-  const size_t thread_cnt = uthread::get_worker_count();
+  const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
   const size_t block = (size + thread_cnt - 1) / thread_cnt;
-  uthread::parallel_for_with_scope<1>(
-      thread_cnt, thread_cnt, [&](size_t i, DereferenceScope &scope) {
-        using it_t = decltype(weight_fv.clbegin());
-        const size_t o_start = i * block;
-        const size_t o_end =
-            std::min(o_start + block, static_cast<size_t>(size));
-        const size_t idx_start = o_start + start;
-        const size_t idx_end = o_end + start;
-
-        if (idx_start >= idx_end) {
-          return;
+  std::vector<rt::Thread> threads;
+  for (int tid = 0; tid < thread_cnt; tid++) {
+    threads.emplace_back([&, tid] {
+      const size_t o_start = tid * block;
+      const size_t o_end = std::min(o_start + block, static_cast<size_t>(size));
+      const size_t idx_start = o_start + start;
+      const size_t idx_end = o_end + start;
+      if (idx_start >= idx_end) {
+        return;
+      }
+      DerefScope scope;
+      auto it = weight_fv.cfbegin(scope) + idx_start;
+      for (size_t oi = o_start; oi < o_end; oi++, ++it) {
+        if (unlikely((oi - o_start) % weight_fv.kNumElementsPerScope == 0)) {
+          scope.renew();
+          it.renew(scope);
         }
-        struct Scope : public DereferenceScope {
-          it_t it;
-
-          void pin() const override { it.pin(); }
-
-          void unpin() const override { it.unpin(); }
-
-          Scope(DereferenceScope *scope) : DereferenceScope(scope) {}
-        } scp(&scope);
-        scp.it =
-            weight_fv.get_const_lite_iter(idx_start, scp, idx_start, idx_end);
-        for (size_t oi = o_start; oi < o_end; oi++, scp.it.next(scp)) {
-          o[oi] = *(scp.it) * (ss * x[oi]);
-        }
-      });
+        o[oi] = *it * (ss * x[oi]);
+      }
+    });
+  }
+  for (auto &t : threads) {
+    t.Join();
+  }
 }
 
 void softmax(float *x, int size) {
@@ -353,88 +382,84 @@ void matmul(float *xout, float *x, float *w, int n, int d) {
   }
 }
 
-void matmul(float *xout, float *x, FarVector<float> &weight_fv, size_t wstart,
-            int n, int d) {
+void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
+            size_t wstart, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
-  const size_t thread_cnt = uthread::get_worker_count();
+  const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
   const size_t block = (d + thread_cnt - 1) / thread_cnt;
-  uthread::parallel_for_with_scope<1>(
-      thread_cnt, thread_cnt, [&](size_t i, DereferenceScope &scope) {
-        const size_t d_start = i * block;
-        const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
-        const size_t idx_start = wstart + d_start * n;
-        const size_t idx_end = wstart + d_end * n;
-        if (d_start >= d_end) {
-          return;
-        }
-        using it_t = decltype(weight_fv.clbegin());
-        struct Scope : public DereferenceScope {
-          it_t it;
-
-          void pin() const override { it.pin(); }
-
-          void unpin() const override { it.unpin(); }
-
-          Scope(DereferenceScope *scope) : DereferenceScope(scope) {}
-        } scp(&scope);
-        scp.it =
-            weight_fv.get_const_lite_iter(idx_start, scp, idx_start, idx_end);
-        for (size_t dd = d_start; dd < d_end; dd++) {
-          float val = 0.0f;
-          for (size_t j = 0; j < n; j++, scp.it.next(scp)) {
-            val += *(scp.it) * x[j];
+  std::vector<rt::Thread> threads;
+  for (int tid = 0; tid < thread_cnt; tid++) {
+    threads.emplace_back([&, tid] {
+      const size_t d_start = tid * block;
+      const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
+      const size_t idx_start = wstart + d_start * n;
+      const size_t idx_end = wstart + d_end * n;
+      if (d_start >= d_end) {
+        return;
+      }
+      DerefScope scope;
+      auto it = weight_fv.cfbegin(scope) + idx_start;
+      for (size_t dd = d_start; dd < d_end; dd++) {
+        float val = 0.0f;
+        for (size_t j = 0; j < n; j++, ++it) {
+          if (unlikely(((dd - d_start) * n + j) %
+                           weight_fv.kNumElementsPerScope ==
+                       0)) {
+            scope.renew();
+            it.renew(scope);
           }
-          xout[dd] = val;
+          val += *it * x[j];
         }
-      });
+        xout[dd] = val;
+      }
+    });
+  }
+  for (auto &t : threads) {
+    t.Join();
+  }
 }
 
-void matmul(FarVector<float> &xout_fv, size_t xout_start, float *x,
-            FarVector<float> &weight_fv, size_t wstart, int n, int d) {
+void matmul(DataFrameVector<float> &xout_fv, size_t xout_start, float *x,
+            DataFrameVector<float> &weight_fv, size_t wstart, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
-  const size_t thread_cnt = uthread::get_worker_count();
+  const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
   const size_t block = (d + thread_cnt - 1) / thread_cnt;
-  uthread::parallel_for_with_scope<1>(
-      thread_cnt, thread_cnt, [&](size_t i, DereferenceScope &scope) {
-        const size_t d_start = i * block;
-        const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
-        const size_t out_start = xout_start + d_start;
-        const size_t out_end = xout_start + d_end;
-        if (d_start >= d_end) {
-          return;
+  std::vector<rt::Thread> threads;
+  for (int tid = 0; tid < thread_cnt; tid++) {
+    threads.emplace_back([&, tid] {
+      const size_t d_start = tid * block;
+      const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
+      const size_t out_start = xout_start + d_start;
+      const size_t out_end = xout_start + d_end;
+      if (d_start >= d_end) {
+        return;
+      }
+      DerefScope scope;
+      auto out_it = xout_fv.fbegin(scope) + out_start;
+      for (size_t dd = d_start; dd < d_end; dd++, ++out_it) {
+        float val = 0.0f;
+        const size_t idx_start = wstart + dd * n;
+        const size_t idx_end = wstart + (dd + 1) * n;
+        auto w_it = weight_fv.cfbegin(scope) + idx_start;
+        for (size_t j = 0; j < n; j++, ++w_it) {
+          if (unlikely(((dd - d_start) * n + j) %
+                           weight_fv.kNumElementsPerScope ==
+                       0)) {
+            scope.renew();
+            out_it.renew(scope);
+            w_it.renew(scope);
+          }
+          val += *w_it * x[j];
         }
-        using w_it_t = decltype(weight_fv.clbegin());
-        using out_it_t = decltype(xout_fv.lbegin());
-        struct Scope : public DereferenceScope {
-          w_it_t w_it;
-          out_it_t out_it;
-          void pin() const override {
-            w_it.pin();
-            out_it.pin();
-          }
-
-          void unpin() const override {
-            w_it.unpin();
-            out_it.unpin();
-          }
-
-          Scope(DereferenceScope *scope) : DereferenceScope(scope) {}
-        } scp(&scope);
-        scp.out_it = xout_fv.get_lite_iter(out_start, scp, out_start, out_end);
-        for (size_t dd = d_start; dd < d_end; dd++, scp.out_it.next(scp)) {
-          float val = 0.0f;
-          const size_t idx_start = wstart + dd * n;
-          const size_t idx_end = wstart + (dd + 1) * n;
-          scp.w_it =
-              weight_fv.get_const_lite_iter(idx_start, scp, idx_start, idx_end);
-          for (size_t j = 0; j < n; j++, scp.w_it.next(scp)) {
-            val += *(scp.w_it) * x[j];
-          }
-          *(scp.out_it) = val;
-        }
-      });
+        *out_it = val;
+      }
+    });
+  }
+  for (auto &t : threads) {
+    t.Join();
+  }
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
@@ -475,60 +500,45 @@ float *forward(Transformer *transformer, int token, int pos) {
     // each head
     {
       const int min_dim = std::min(dim, kv_dim);
-      const size_t thread_cnt = uthread::get_worker_count();
+      const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
       const size_t block = (min_dim / 2 + thread_cnt - 1) / thread_cnt;
-      uthread::parallel_for_with_scope<1>(
-          thread_cnt, thread_cnt, [&](size_t i, DereferenceScope &scope) {
-            const int idx_start = i * block * 2;
-            const int idx_end =
-                std::min(min_dim, static_cast<int>(idx_start + block * 2));
-            if (idx_start >= idx_end) {
-              return;
+      std::vector<rt::Thread> threads;
+      for (int tid = 0; tid < thread_cnt; tid++) {
+        threads.emplace_back([&, tid] {
+          const int idx_start = tid * block * 2;
+          const int idx_end =
+              std::min(min_dim, static_cast<int>(idx_start + block * 2));
+          if (idx_start >= idx_end) {
+            return;
+          }
+          DerefScope scope;
+          auto it = s->key_cache.fbegin(scope) + key_cache_start + idx_start;
+          auto it1 =
+              s->key_cache.fbegin(scope) + key_cache_start + idx_start + 1;
+          for (int i = idx_start; i < idx_end; i += 2, it += 2, it1 += 2) {
+            if (unlikely((i - idx_start) % s->key_cache.kNumElementsPerScope ==
+                         0)) {
+              scope.renew();
+              it.renew(scope);
+              it1.renew(scope);
             }
-            using it_t = decltype(s->key_cache.lbegin());
-            struct Scope : public DereferenceScope {
-              it_t it;
-              it_t it1;
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
 
-              void pin() const override {
-                it.pin();
-                it1.pin();
-              }
-
-              void unpin() const override {
-                it.unpin();
-                it1.unpin();
-              }
-
-              void next2() {
-                it.nextn(2, *this);
-                it1.nextn(2, *this);
-              }
-
-              Scope(DereferenceScope *scope) : DereferenceScope(scope) {}
-            } scp(&scope);
-            scp.it = s->key_cache.get_lite_iter(
-                key_cache_start + idx_start, scp, key_cache_start + idx_start,
-                key_cache_start + idx_end);
-            scp.it1 = s->key_cache.get_lite_iter(
-                key_cache_start + idx_start + 1, scp,
-                key_cache_start + idx_start, key_cache_start + idx_end);
-            for (int i = idx_start; i < idx_end; i += 2, scp.next2()) {
-              int head_dim = i % head_size;
-              float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-              float val = pos * freq;
-              float fcr = cosf(val);
-              float fci = sinf(val);
-
-              int rotn = 2; // how many vectors? 2 = q & k, 1 = q only
-              float v0 = *(scp.it);
-              float v1 = *(scp.it1);
-              *(scp.it) = v0 * fcr - v1 * fci;
-              *(scp.it1) = v0 * fci + v1 * fcr;
-            }
-          });
+            float v0 = *it;
+            float v1 = *it1;
+            *it = v0 * fcr - v1 * fci;
+            *it1 = v0 * fci + v1 * fcr;
+          }
+        });
+      }
+      for (auto &t : threads) {
+        t.Join();
+      }
     }
-
     for (int i = 0; i < dim; i += 2) {
       int head_dim = i % head_size;
       float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -536,8 +546,7 @@ float *forward(Transformer *transformer, int token, int pos) {
       float fcr = cosf(val);
       float fci = sinf(val);
 
-      int rotn = 1;      // how many vectors? 2 = q & k, 1 = q only
-      float *vec = s->q; // the vector to rotate (query or key)
+      float *vec = s->q; // the vector to rotate (query)
       float v0 = vec[i];
       float v1 = vec[i + 1];
       vec[i] = v0 * fcr - v1 * fci;
@@ -545,74 +554,77 @@ float *forward(Transformer *transformer, int token, int pos) {
     }
 
     // multihead attention. iterate over all heads
-    const size_t thread_cnt = uthread::get_worker_count();
+    const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
     const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
-    uthread::parallel_for_with_scope<1>(
-        thread_cnt, thread_cnt, [&](size_t i, DereferenceScope &scope) {
-          const size_t h_start = i * block;
-          const size_t h_end =
-              std::min(h_start + block, static_cast<size_t>(p->n_heads));
-          if (h_start >= h_end) {
-            return;
-          }
-          for (size_t h = h_start; h < h_end; h++) {
-            // get the query vector for this head
-            float *q = s->q + h * head_size;
-            // attention scores for this head
-            float *att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
-            using it_t = decltype(s->key_cache.clbegin());
-            struct Scope : public DereferenceScope {
-              it_t it;
-
-              void pin() const override { it.pin(); }
-
-              void unpin() const override { it.unpin(); }
-
-              Scope(DereferenceScope *scope) : DereferenceScope(scope) {}
-            } scp(&scope);
-            for (int t = 0; t <= pos; t++) {
-              // get the key vector for this head and at this timestep
-              const size_t key_cache_base =
-                  loff + t * kv_dim + (h / kv_mul) * head_size;
-              scp.it = s->key_cache.get_const_lite_iter(
-                  key_cache_base, scp, key_cache_base,
-                  key_cache_base + head_size);
-              // calculate the attention score as the dot
-              // product of q and k
-              float score = 0.0f;
-              for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
-                score += q[i] * (*(scp.it));
+    std::vector<rt::Thread> threads;
+    for (int tid = 0; tid < thread_cnt; tid++) {
+      threads.emplace_back([&, tid] {
+        const size_t h_start = tid * block;
+        const size_t h_end =
+            std::min(h_start + block, static_cast<size_t>(p->n_heads));
+        if (h_start >= h_end) {
+          return;
+        }
+        DerefScope scope;
+        for (size_t h = h_start; h < h_end; h++) {
+          // get the query vector for this head
+          float *q = s->q + h * head_size;
+          // attention scores for this head
+          float *att = s->att + h * p->seq_len;
+          // iterate over all timesteps, including the current one
+          for (int t = 0; t <= pos; t++) {
+            // get the key vector for this head and at this timestep
+            const size_t key_cache_base =
+                loff + t * kv_dim + (h / kv_mul) * head_size;
+            auto it = s->key_cache.cfbegin(scope) + key_cache_base;
+            // calculate the attention score as the dot
+            // product of q and k
+            float score = 0.0f;
+            for (int i = 0; i < head_size; i++, ++it) {
+              if (unlikely((t * head_size + i) %
+                               s->key_cache.kNumElementsPerScope ==
+                           0)) {
+                scope.renew();
+                it.renew(scope);
               }
-              score /= sqrtf(head_size);
-              // save the score to the attention buffer
-              att[t] = score;
+              score += q[i] * (*it);
             }
+            score /= sqrtf(head_size);
+            // save the score to the attention buffer
+            att[t] = score;
+          }
+          // softmax the scores to get attention weights, from 0..pos
+          // inclusively
+          softmax(att, pos + 1);
 
-            // softmax the scores to get attention weights, from 0..pos
-            // inclusively
-            softmax(att, pos + 1);
-
-            // weighted sum of the values, store back into xb
-            float *xb = s->xb + h * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-              // get the value vector for this head and at this
-              // timestep
-              const size_t value_cache_base =
-                  loff + t * kv_dim + (h / kv_mul) * head_size;
-              scp.it = s->value_cache.get_const_lite_iter(
-                  value_cache_base, scp, value_cache_base,
-                  value_cache_base + head_size);
-              // get the attention weight for this timestep
-              float a = att[t];
-              // accumulate the weighted value into xb
-              for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
-                xb[i] += a * (*(scp.it));
+          // weighted sum of the values, store back into xb
+          float *xb = s->xb + h * head_size;
+          memset(xb, 0, head_size * sizeof(float));
+          for (int t = 0; t <= pos; t++) {
+            // get the value vector for this head and at this
+            // timestep
+            const size_t value_cache_base =
+                loff + t * kv_dim + (h / kv_mul) * head_size;
+            auto it = s->value_cache.cfbegin(scope) + value_cache_base;
+            // get the attention weight for this timestep
+            float a = att[t];
+            // accumulate the weighted value into xb
+            for (int i = 0; i < head_size; i++, ++it) {
+              if (unlikely((t * head_size + i) %
+                               s->value_cache.kNumElementsPerScope ==
+                           0)) {
+                scope.renew();
+                it.renew(scope);
               }
+              xb[i] += a * (*it);
             }
           }
-        });
+        }
+      });
+    }
+    for (auto &t : threads) {
+      t.Join();
+    }
 
     // final matmul to get the output of the attention
     matmul(s->xb2, s->xb, w->wo, l * dim * dim, dim, dim);
@@ -1177,6 +1189,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   int token;            // stores the current token to feed into the transformer
   int prev_token;
   int pos = 0; // position in the sequence
+  size_t assistant_tokens = 0;
+  size_t assistant_t = 0;
   while (pos < steps) {
     // when it is the user's turn to contribute tokens to the dialog...
     if (user_turn) {
@@ -1201,6 +1215,9 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         // otherwise get user prompt from stdin
         read_stdin("User: ", user_prompt, sizeof(user_prompt));
       }
+      if (!strcmp(user_prompt, "<end>")) {
+        break;
+      }
       // render user/system prompts into the Llama 2 Chat schema
       if (pos == 0 && system_prompt[0] != '\0') {
         char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
@@ -1209,17 +1226,19 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         char user_template[] = "[INST] %s [/INST]";
         sprintf(rendered_prompt, user_template, user_prompt);
       }
-      auto start = __rdtsc();
+      auto start = get_cycles();
       // encode the rendered prompt into tokens
       encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens,
              &num_prompt_tokens);
-      auto end = __rdtsc();
-      printf("encode: %llu\n", end - start);
+      auto end = get_cycles();
+      assistant_t += end - start;
+      // printf("encode: %llu\n", end - start);
       user_idx = 0; // reset the user index
       user_turn = 0;
       printf("Assistant: ");
     }
 
+    auto start = get_cycles();
     // determine the token to pass into the transformer next
     if (user_idx < num_prompt_tokens) {
       // if we are still processing the input prompt, force the next
@@ -1233,15 +1252,24 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     if (token == 2) {
       user_turn = 1;
     }
-
+    assistant_tokens++;
     // forward the transformer to get logits for the next token
+    auto fstart = get_cycles();
     float *logits = forward(transformer, token, pos);
+    auto fend = get_cycles();
+    // printf("forward: %lu\n", fend - fstart);
+    auto sstart = get_cycles();
     next = sample(sampler, logits);
+    auto send = get_cycles();
+    // printf("forward: %lu\n", fend - fstart);
     pos++;
 
     if (user_idx >= num_prompt_tokens && next != 2) {
       // the Assistant is responding, so print its output
+      auto dstart = get_cycles();
       char *piece = decode(tokenizer, token, next);
+      auto dend = get_cycles();
+      // printf("decode: %lu\n", dend - dstart);
       safe_printf(piece); // same as printf("%s", piece), but skips
                           // "unsafe" bytes
       fflush(stdout);
@@ -1249,8 +1277,14 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     if (next == 2) {
       printf("\n");
     }
+    auto end = get_cycles();
+    assistant_t += end - start;
   }
   printf("\n");
+  printf("achieved tok/s: %lf\n",
+         static_cast<double>(assistant_tokens) /
+             (static_cast<double>(assistant_t) / 2.8 / 1e9));
+
   free(prompt_tokens);
 }
 
@@ -1275,123 +1309,137 @@ void error_usage() {
   exit(EXIT_FAILURE);
 }
 
-int main(int argc, char *argv[]) {
-  Configure config;
-#ifdef STANDALONE
-  constexpr size_t FAR_ARGC = 0;
-  config.server_addr = "127.0.0.1";
-  config.server_port = "50000";
-  config.server_buffer_size = 1024L * 1024 * 1024 * 32;
-  config.client_buffer_size = 1024L * 1024 * 4;
-  config.evict_batch_size = 64 * 1024;
-  config.max_thread_cnt = 8;
-  Server server(config);
-  std::thread server_thread([&server] { server.start(); });
-  std::this_thread::sleep_for(1s);
-#else
-  constexpr size_t FAR_ARGC = 1;
-  config.from_file(argv[1]);
-#endif
-  FarLib::runtime_init(config);
-  {
-    // default parameters
-    char *checkpoint_path = NULL; // e.g. out/model.bin
-    const char *tokenizer_path = "tokenizer.bin";
-    float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 =
-                              // original. don't set higher
-    float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works
-                              // well, but slower
-    int steps = 256;          // number of steps to run for
-    char *prompt = NULL;      // prompt string
-    unsigned long long rng_seed = 1; // seed rng with time by default
-    const char *mode = "generate";   // generate|chat
-    char *system_prompt =
-        NULL; // the (optional) system prompt to use in chat mode
+std::unique_ptr<FarMemManager> init(char *ip_addr_port_str) {
+  std::string ip_addr_port(ip_addr_port_str);
+  auto raddr = helpers::str_to_netaddr(ip_addr_port);
+  return std::unique_ptr<FarMemManager>(FarMemManagerFactory::build(
+      kCacheSize, kNumGCThreads,
+      new TCPDevice(raddr, kNumConnections, kFarMemSize)));
+}
 
-    // poor man's C argparse so we can override the defaults above from the
-    // command line
-    if (argc >= 2 + FAR_ARGC) {
-      checkpoint_path = argv[1 + FAR_ARGC];
-    } else {
-      error_usage();
-    }
-    for (int i = 2 + FAR_ARGC; i < argc; i += 2) {
-      // do some basic validation
-      if (i + 1 >= argc) {
-        error_usage();
-      } // must have arg after flag
-      if (argv[i][0] != '-') {
-        error_usage();
-      } // must start with dash
-      if (strlen(argv[i]) != 2) {
-        error_usage();
-      } // must be -x (one dash, one letter)
-      // read in the args
-      if (argv[i][1] == 't') {
-        temperature = atof(argv[i + 1]);
-      } else if (argv[i][1] == 'p') {
-        topp = atof(argv[i + 1]);
-      } else if (argv[i][1] == 's') {
-        rng_seed = atoi(argv[i + 1]);
-      } else if (argv[i][1] == 'n') {
-        steps = atoi(argv[i + 1]);
-      } else if (argv[i][1] == 'i') {
-        prompt = argv[i + 1];
-      } else if (argv[i][1] == 'z') {
-        tokenizer_path = argv[i + 1];
-      } else if (argv[i][1] == 'm') {
-        mode = argv[i + 1];
-      } else if (argv[i][1] == 'y') {
-        system_prompt = argv[i + 1];
-      } else {
-        error_usage();
-      }
-    }
+static constexpr size_t AIFM_PRE_ARGS_COUNT = 2;
+struct Args {
+  int argc;
+  char **argv;
+};
+void _main(void *arg) {
+  // default parameters
+  Args *args = static_cast<Args *>(arg);
+  int argc = args->argc;
+  char **argv = args->argv;
+  char *checkpoint_path = NULL; // e.g. out/model.bin
+  const char *tokenizer_path = "../tokenizer.bin";
+  float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 =
+                            // original. don't set higher
+  float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works
+                            // well, but slower
+  int steps = 256;          // number of steps to run for
+  char *prompt = NULL;      // prompt string
+  unsigned long long rng_seed = 1; // seed rng with time by default
+  const char *mode = "generate";   // generate|chat
+  char *system_prompt =
+      NULL; // the (optional) system prompt to use in chat mode
+  // poor man's C argparse so we can override the defaults above from the
+  // command line
 
-    // parameter validation/overrides
-    if (rng_seed <= 0)
-      rng_seed = (unsigned int)time(NULL);
-    if (temperature < 0.0)
-      temperature = 0.0;
-    if (topp < 0.0 || 1.0 < topp)
-      topp = 0.9;
-    if (steps < 0)
-      steps = 0;
-
-    // build the Transformer via the model .bin file
-    Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
-    if (steps == 0 || steps > transformer.config.seq_len)
-      steps = transformer.config.seq_len; // override to ~max length
-
-    // build the Tokenizer via the tokenizer .bin file
-    Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
-
-    // build the Sampler
-    Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
-                  rng_seed);
-
-    // run!
-    if (strcmp(mode, "generate") == 0) {
-      generate(&transformer, &tokenizer, &sampler, prompt, steps);
-    } else if (strcmp(mode, "chat") == 0) {
-      chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
-    } else {
-      fprintf(stderr, "unknown mode: %s\n", mode);
-      error_usage();
-    }
-
-    // memory and file handles cleanup
-    free_sampler(&sampler);
-    free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
+  std::unique_ptr<FarMemManager> manager = init(argv[AIFM_PRE_ARGS_COUNT]);
+  if (argc >= 2 + AIFM_PRE_ARGS_COUNT) {
+    checkpoint_path = argv[1 + AIFM_PRE_ARGS_COUNT];
+  } else {
+    error_usage();
   }
-  FarLib::runtime_destroy();
-#ifdef STANDALONE
-  server_thread.join();
-#endif
+
+  for (int i = 2 + AIFM_PRE_ARGS_COUNT; i < argc; i += 2) {
+    // do some basic validation
+    if (i + 1 >= argc) {
+      error_usage();
+    } // must have arg after flag
+    if (argv[i][0] != '-') {
+      error_usage();
+    } // must start with dash
+    if (strlen(argv[i]) != 2) {
+      error_usage();
+    } // must be -x (one dash, one letter)
+    // read in the args
+    if (argv[i][1] == 't') {
+      temperature = atof(argv[i + 1]);
+    } else if (argv[i][1] == 'p') {
+      topp = atof(argv[i + 1]);
+    } else if (argv[i][1] == 's') {
+      rng_seed = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'n') {
+      steps = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'i') {
+      prompt = argv[i + 1];
+    } else if (argv[i][1] == 'z') {
+      tokenizer_path = argv[i + 1];
+    } else if (argv[i][1] == 'm') {
+      mode = argv[i + 1];
+    } else if (argv[i][1] == 'y') {
+      system_prompt = argv[i + 1];
+    } else {
+      error_usage();
+    }
+  }
+  if (manager.get() == nullptr) {
+    error_usage();
+  }
+
+  // parameter validation/overrides
+  if (rng_seed <= 0)
+    rng_seed = (unsigned int)time(NULL);
+  if (temperature < 0.0)
+    temperature = 0.0;
+  if (topp < 0.0 || 1.0 < topp)
+    topp = 0.9;
+  if (steps < 0)
+    steps = 0;
+
+  // build the Transformer via the model .bin file
+  Transformer transformer = build_transformer(manager.get(), checkpoint_path);
+  if (steps == 0 || steps > transformer.config.seq_len)
+    steps = transformer.config.seq_len; // override to ~max length
+
+  // build the Tokenizer via the tokenizer .bin file
+  Tokenizer tokenizer;
+  build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+
+  // build the Sampler
+  Sampler sampler;
+  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
+                rng_seed);
+
+  // run!
+  if (strcmp(mode, "generate") == 0) {
+    generate(&transformer, &tokenizer, &sampler, prompt, steps);
+  } else if (strcmp(mode, "chat") == 0) {
+    chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+  } else {
+    fprintf(stderr, "unknown mode: %s\n", mode);
+    error_usage();
+  }
+
+  // memory and file handles cleanup
+  free_sampler(&sampler);
+  free_tokenizer(&tokenizer);
+  free_transformer(&transformer);
+}
+int main(int argc, char *argv[]) {
+  if (argc < 3) {
+    std::cerr << "usage: [cfg_file] [ip_addr:port]" << std::endl;
+    return -EINVAL;
+  }
+
+  char conf_path[strlen(argv[1]) + 1];
+  strcpy(conf_path, argv[1]);
+
+  Args args{.argc = argc, .argv = argv};
+  int ret = runtime_init(conf_path, _main, &args);
+  if (ret) {
+    std::cerr << "failed to start runtime" << std::endl;
+    return ret;
+  }
+  std::cout << "main end" << std::endl;
   return 0;
 }
 #endif

@@ -19,6 +19,7 @@
 #include "utils/control.hpp"
 #include "utils/debug.hpp"
 #include "utils/parallel.hpp"
+#include "utils/perf.hpp"
 #if defined _WIN32
 #include "win.h"
 #else
@@ -33,6 +34,10 @@
 using namespace FarLib;
 using namespace FarLib::rdma;
 using namespace std::chrono_literals;
+static constexpr size_t UTHREAD_FACTOR = 8;
+static inline size_t get_thread_count() {
+    return uthread::get_worker_count() * UTHREAD_FACTOR;
+}
 typedef struct {
     int dim;         // transformer dimension
     int hidden_dim;  // for ffn layers
@@ -298,7 +303,7 @@ void rmsnorm(float* o, float* x, FarVector<float>& weight_fv, size_t start,
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
     // normalize and scale
-    const size_t thread_cnt = uthread::get_worker_count();
+    const size_t thread_cnt = get_thread_count();
     const size_t block = (size + thread_cnt - 1) / thread_cnt;
     uthread::parallel_for_with_scope<1>(
         thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
@@ -367,7 +372,7 @@ void matmul(float* xout, float* x, FarVector<float>& weight_fv, size_t wstart,
             int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
-    const size_t thread_cnt = uthread::get_worker_count();
+    const size_t thread_cnt = get_thread_count();
     const size_t block = (d + thread_cnt - 1) / thread_cnt;
     uthread::parallel_for_with_scope<1>(
         thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
@@ -405,7 +410,7 @@ void matmul(FarVector<float>& xout_fv, size_t xout_start, float* x,
             FarVector<float>& weight_fv, size_t wstart, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
-    const size_t thread_cnt = uthread::get_worker_count();
+    const size_t thread_cnt = get_thread_count();
     const size_t block = (d + thread_cnt - 1) / thread_cnt;
     uthread::parallel_for_with_scope<1>(
         thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
@@ -489,7 +494,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         // each head
         {
             const int min_dim = std::min(dim, kv_dim);
-            const size_t thread_cnt = uthread::get_worker_count();
+            const size_t thread_cnt = get_thread_count();
             const size_t block = (min_dim / 2 + thread_cnt - 1) / thread_cnt;
             uthread::parallel_for_with_scope<1>(
                 thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
@@ -562,7 +567,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // multihead attention. iterate over all heads
-        const size_t thread_cnt = uthread::get_worker_count();
+        const size_t thread_cnt = get_thread_count();
         const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
         uthread::parallel_for_with_scope<1>(
             thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
@@ -1403,39 +1408,38 @@ int main(int argc, char* argv[]) {
               << "G" << std::endl;
     std::cout << "core count: " << config.max_thread_cnt << std::endl;
     FarLib::runtime_init(config);
-    {
-        // build the Transformer via the model .bin file
-        Transformer transformer;
-        build_transformer(&transformer, checkpoint_path);
-        if (steps == 0 || steps > transformer.config.seq_len)
-            steps = transformer.config.seq_len;  // override to ~max length
+    // perf_init();
+    // perf_profile([&] {
+    // build the Transformer via the model .bin file
+    Transformer transformer;
+    build_transformer(&transformer, checkpoint_path);
+    if (steps == 0 || steps > transformer.config.seq_len)
+        steps = transformer.config.seq_len;  // override to ~max length
 
-        // build the Tokenizer via the tokenizer .bin file
-        Tokenizer tokenizer;
-        build_tokenizer(&tokenizer, tokenizer_path,
-                        transformer.config.vocab_size);
+    // build the Tokenizer via the tokenizer .bin file
+    Tokenizer tokenizer;
+    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
-        // build the Sampler
-        Sampler sampler;
-        build_sampler(&sampler, transformer.config.vocab_size, temperature,
-                      topp, rng_seed);
+    // build the Sampler
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
+                  rng_seed);
 
-        // run!
-        if (strcmp(mode, "generate") == 0) {
-            generate(&transformer, &tokenizer, &sampler, prompt, steps);
-        } else if (strcmp(mode, "chat") == 0) {
-            chat(&transformer, &tokenizer, &sampler, prompt, system_prompt,
-                 steps);
-        } else {
-            fprintf(stderr, "unknown mode: %s\n", mode);
-            error_usage();
-        }
-
-        // memory and file handles cleanup
-        free_sampler(&sampler);
-        free_tokenizer(&tokenizer);
-        free_transformer(&transformer);
+    // run!
+    if (strcmp(mode, "generate") == 0) {
+        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    } else if (strcmp(mode, "chat") == 0) {
+        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+    } else {
+        fprintf(stderr, "unknown mode: %s\n", mode);
+        error_usage();
     }
+
+    // memory and file handles cleanup
+    free_sampler(&sampler);
+    free_tokenizer(&tokenizer);
+    free_transformer(&transformer);
+    // }).print();
     FarLib::runtime_destroy();
 #ifdef STANDALONE
     server_thread.join();

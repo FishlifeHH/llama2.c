@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fconcepts -Wno-subobject-linkage")
+set(CMAKE_BUILD_TYPE "Release")
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../inc/)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../shenango/bindings/cc/)

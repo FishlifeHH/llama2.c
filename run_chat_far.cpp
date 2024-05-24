@@ -1,6 +1,8 @@
 /* Inference for Llama-2 Transformer model in pure C */
 extern "C" {
+#include <base/log.h>
 #include <runtime/runtime.h>
+#include <runtime/thread.h>
 }
 
 #include <ctype.h>
@@ -12,21 +14,18 @@ extern "C" {
 #include <time.h>
 #include <x86intrin.h>
 
-#include <chrono>
-#include <memory>
-#include <vector>
-
 #include "dataframe_vector.hpp"
 #include "deref_scope.hpp"
 #include "manager.hpp"
-#include "thread.h"
+#include <chrono>
+#include <memory>
+#include <vector>
 #if defined _WIN32
 #include "win.h"
 #else
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
-
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -115,6 +114,11 @@ struct RunState {
 
 static constexpr bool MULTITHREAD_ENABLE =
     DataFrameVector<float>::MULTITHREAD_ENABLE;
+static constexpr size_t UTHREAD_FACTOR = DataFrameVector<float>::UTHREAD_FACTOR;
+static inline size_t get_thread_count() {
+  // return 1;
+  return MULTITHREAD_ENABLE ? need_perf_thread_count * UTHREAD_FACTOR : 1;
+}
 struct Transformer {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
@@ -320,7 +324,7 @@ void rmsnorm(float *o, float *x, DataFrameVector<float> &weight_fv,
   ss += 1e-5f;
   ss = 1.0f / sqrtf(ss);
   // normalize and scale
-  const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
+  const size_t thread_cnt = get_thread_count();
   const size_t block = (size + thread_cnt - 1) / thread_cnt;
   std::vector<rt::Thread> threads;
   for (int tid = 0; tid < thread_cnt; tid++) {
@@ -386,7 +390,7 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
             size_t wstart, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
-  const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
+  const size_t thread_cnt = get_thread_count();
   const size_t block = (d + thread_cnt - 1) / thread_cnt;
   std::vector<rt::Thread> threads;
   for (int tid = 0; tid < thread_cnt; tid++) {
@@ -424,7 +428,7 @@ void matmul(DataFrameVector<float> &xout_fv, size_t xout_start, float *x,
             DataFrameVector<float> &weight_fv, size_t wstart, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
-  const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
+  const size_t thread_cnt = get_thread_count();
   const size_t block = (d + thread_cnt - 1) / thread_cnt;
   std::vector<rt::Thread> threads;
   for (int tid = 0; tid < thread_cnt; tid++) {
@@ -500,7 +504,7 @@ float *forward(Transformer *transformer, int token, int pos) {
     // each head
     {
       const int min_dim = std::min(dim, kv_dim);
-      const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
+      const size_t thread_cnt = get_thread_count();
       const size_t block = (min_dim / 2 + thread_cnt - 1) / thread_cnt;
       std::vector<rt::Thread> threads;
       for (int tid = 0; tid < thread_cnt; tid++) {
@@ -554,7 +558,7 @@ float *forward(Transformer *transformer, int token, int pos) {
     }
 
     // multihead attention. iterate over all heads
-    const size_t thread_cnt = MULTITHREAD_ENABLE ? need_perf_thread_count : 1;
+    const size_t thread_cnt = get_thread_count();
     const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
     std::vector<rt::Thread> threads;
     for (int tid = 0; tid < thread_cnt; tid++) {
@@ -1255,6 +1259,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     assistant_tokens++;
     // forward the transformer to get logits for the next token
     auto fstart = get_cycles();
+    // std::cout << "forward" << std::endl;
     float *logits = forward(transformer, token, pos);
     auto fend = get_cycles();
     // printf("forward: %lu\n", fend - fstart);
@@ -1396,16 +1401,19 @@ void _main(void *arg) {
     steps = 0;
 
   // build the Transformer via the model .bin file
+  std::cout << "build transformer" << std::endl;
   Transformer transformer = build_transformer(manager.get(), checkpoint_path);
   if (steps == 0 || steps > transformer.config.seq_len)
     steps = transformer.config.seq_len; // override to ~max length
 
   // build the Tokenizer via the tokenizer .bin file
   Tokenizer tokenizer;
+  std::cout << "build tokenizer" << std::endl;
   build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
   // build the Sampler
   Sampler sampler;
+  std::cout << "build sampler" << std::endl;
   build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
                 rng_seed);
 
@@ -1425,6 +1433,14 @@ void _main(void *arg) {
   free_transformer(&transformer);
 }
 int main(int argc, char *argv[]) {
+  // #ifndef NDEBUG
+  // accept signal from VSCode for pausing/stopping
+  char *sudo_uid = getenv("SUDO_UID");
+  if (sudo_uid) {
+    setresuid(0, 0, atoi(sudo_uid));
+  }
+  std::cout << "In Debug Mode" << std::endl;
+  // #endif
   if (argc < 3) {
     std::cerr << "usage: [cfg_file] [ip_addr:port]" << std::endl;
     return -EINVAL;

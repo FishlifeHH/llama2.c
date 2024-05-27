@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <thread>
+#include <unordered_map>
 
 #include "cache/accessor.hpp"
 #include "data_structure/far_vector.hpp"
@@ -31,12 +32,35 @@
 // ----------------------------------------------------------------------------
 // Transformer model
 
+static std::unordered_map<std::string, size_t> tus;
+static std::unordered_map<std::string, size_t> cnts;
 using namespace FarLib;
 using namespace FarLib::rdma;
 using namespace std::chrono_literals;
 static constexpr size_t UTHREAD_FACTOR = FarVector<float>::UTHREAD_FACTOR;
 static inline size_t get_thread_count() {
     return uthread::get_worker_count() * UTHREAD_FACTOR;
+}
+
+template <typename F>
+static void prof(const std::string name, F&& f, size_t count = 1) {
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        f();
+        auto end = std::chrono::high_resolution_clock::now();
+        tus[name] +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+                .count();
+        cnts[name] += count;
+    }
+}
+
+void prof_res_print() {
+    for (auto& p : tus) {
+        std::cout << "avg " << p.first << ": "
+                  << static_cast<double>(p.second) / cnts[p.first] << "us"
+                  << std::endl;
+    }
 }
 typedef struct {
     int dim;         // transformer dimension
@@ -475,7 +499,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     // forward all the layers
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight, l * dim, dim);
+        prof("rmsnorm1",
+             [&] { rmsnorm(s->xb, x, w->rms_att_weight, l * dim, dim); });
 
         // key and value point to the kv cache
         int loff =
@@ -484,15 +509,22 @@ float* forward(Transformer* transformer, int token, int pos) {
         // qkv matmuls for this position
         const size_t key_cache_start = loff + pos * kv_dim;
         const size_t value_cache_start = loff + pos * kv_dim;
-        matmul(s->q, s->xb, w->wq, l * dim * dim, dim, dim);
-        matmul(s->key_cache, loff + pos * kv_dim, s->xb, w->wk,
-               l * dim * kv_dim, dim, kv_dim);
-        matmul(s->value_cache, loff + pos * kv_dim, s->xb, w->wv,
-               l * dim * kv_dim, dim, kv_dim);
+        prof("matmul1",
+             [&] { matmul(s->q, s->xb, w->wq, l * dim * dim, dim, dim); });
+
+        prof(
+            "matmul2",
+            [&] {
+                matmul(s->key_cache, loff + pos * kv_dim, s->xb, w->wk,
+                       l * dim * kv_dim, dim, kv_dim);
+                matmul(s->value_cache, loff + pos * kv_dim, s->xb, w->wv,
+                       l * dim * kv_dim, dim, kv_dim);
+            },
+            2);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in
         // each head
-        {
+        prof("uth1", [&] {
             const int min_dim = std::min(dim, kv_dim);
             const size_t thread_cnt = get_thread_count();
             const size_t block = (min_dim / 2 + thread_cnt - 1) / thread_cnt;
@@ -549,7 +581,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                         *(scp.it1) = v0 * fci + v1 * fcr;
                     }
                 });
-        }
+        });
 
         for (int i = 0; i < dim; i += 2) {
             int head_dim = i % head_size;
@@ -566,79 +598,85 @@ float* forward(Transformer* transformer, int token, int pos) {
             vec[i + 1] = v0 * fci + v1 * fcr;
         }
 
-        // multihead attention. iterate over all heads
-        const size_t thread_cnt = get_thread_count();
-        const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
-        uthread::parallel_for_with_scope<1>(
-            thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
-                const size_t h_start = i * block;
-                const size_t h_end =
-                    std::min(h_start + block, static_cast<size_t>(p->n_heads));
-                if (h_start >= h_end) {
-                    return;
-                }
-                for (size_t h = h_start; h < h_end; h++) {
-                    // get the query vector for this head
-                    float* q = s->q + h * head_size;
-                    // attention scores for this head
-                    float* att = s->att + h * p->seq_len;
-                    // iterate over all timesteps, including the current one
-                    using it_t = decltype(s->key_cache.clbegin());
-                    struct Scope : public DereferenceScope {
-                        it_t it;
-
-                        void pin() const override { it.pin(); }
-
-                        void unpin() const override { it.unpin(); }
-
-                        Scope(DereferenceScope* scope)
-                            : DereferenceScope(scope) {}
-                    } scp(&scope);
-                    for (int t = 0; t <= pos; t++) {
-                        // get the key vector for this head and at this timestep
-                        const size_t key_cache_base =
-                            loff + t * kv_dim + (h / kv_mul) * head_size;
-                        scp.it = s->key_cache.get_const_lite_iter(
-                            key_cache_base, scp, key_cache_base,
-                            key_cache_base + head_size);
-                        // calculate the attention score as the dot
-                        // product of q and k
-                        float score = 0.0f;
-                        for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
-                            score += q[i] * (*(scp.it));
-                        }
-                        score /= sqrtf(head_size);
-                        // save the score to the attention buffer
-                        att[t] = score;
+        prof("multihead", [&] {
+            // multihead attention. iterate over all heads
+            const size_t thread_cnt = get_thread_count();
+            const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
+            uthread::parallel_for_with_scope<1>(
+                thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
+                    const size_t h_start = i * block;
+                    const size_t h_end = std::min(
+                        h_start + block, static_cast<size_t>(p->n_heads));
+                    if (h_start >= h_end) {
+                        return;
                     }
+                    for (size_t h = h_start; h < h_end; h++) {
+                        // get the query vector for this head
+                        float* q = s->q + h * head_size;
+                        // attention scores for this head
+                        float* att = s->att + h * p->seq_len;
+                        // iterate over all timesteps, including the current one
+                        using it_t = decltype(s->key_cache.clbegin());
+                        struct Scope : public DereferenceScope {
+                            it_t it;
 
-                    // softmax the scores to get attention weights, from 0..pos
-                    // inclusively
-                    softmax(att, pos + 1);
+                            void pin() const override { it.pin(); }
 
-                    // weighted sum of the values, store back into xb
-                    float* xb = s->xb + h * head_size;
-                    memset(xb, 0, head_size * sizeof(float));
-                    for (int t = 0; t <= pos; t++) {
-                        // get the value vector for this head and at this
-                        // timestep
-                        const size_t value_cache_base =
-                            loff + t * kv_dim + (h / kv_mul) * head_size;
-                        scp.it = s->value_cache.get_const_lite_iter(
-                            value_cache_base, scp, value_cache_base,
-                            value_cache_base + head_size);
-                        // get the attention weight for this timestep
-                        float a = att[t];
-                        // accumulate the weighted value into xb
-                        for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
-                            xb[i] += a * (*(scp.it));
+                            void unpin() const override { it.unpin(); }
+
+                            Scope(DereferenceScope* scope)
+                                : DereferenceScope(scope) {}
+                        } scp(&scope);
+                        for (int t = 0; t <= pos; t++) {
+                            // get the key vector for this head and at this
+                            // timestep
+                            const size_t key_cache_base =
+                                loff + t * kv_dim + (h / kv_mul) * head_size;
+                            scp.it = s->key_cache.get_const_lite_iter(
+                                key_cache_base, scp, key_cache_base,
+                                key_cache_base + head_size);
+                            // calculate the attention score as the dot
+                            // product of q and k
+                            float score = 0.0f;
+                            for (int i = 0; i < head_size;
+                                 i++, scp.it.next(scp)) {
+                                score += q[i] * (*(scp.it));
+                            }
+                            score /= sqrtf(head_size);
+                            // save the score to the attention buffer
+                            att[t] = score;
+                        }
+
+                        // softmax the scores to get attention weights, from
+                        // 0..pos inclusively
+                        softmax(att, pos + 1);
+
+                        // weighted sum of the values, store back into xb
+                        float* xb = s->xb + h * head_size;
+                        memset(xb, 0, head_size * sizeof(float));
+                        for (int t = 0; t <= pos; t++) {
+                            // get the value vector for this head and at this
+                            // timestep
+                            const size_t value_cache_base =
+                                loff + t * kv_dim + (h / kv_mul) * head_size;
+                            scp.it = s->value_cache.get_const_lite_iter(
+                                value_cache_base, scp, value_cache_base,
+                                value_cache_base + head_size);
+                            // get the attention weight for this timestep
+                            float a = att[t];
+                            // accumulate the weighted value into xb
+                            for (int i = 0; i < head_size;
+                                 i++, scp.it.next(scp)) {
+                                xb[i] += a * (*(scp.it));
+                            }
                         }
                     }
-                }
-            });
+                });
+        });
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo, l * dim * dim, dim, dim);
+        prof("matmul1",
+             [&] { matmul(s->xb2, s->xb, w->wo, l * dim * dim, dim, dim); });
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -650,8 +688,15 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) *
         // self.w3(x)) first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1, l * dim * hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3, l * dim * hidden_dim, dim, hidden_dim);
+        prof(
+            "matmul1",
+            [&] {
+                matmul(s->hb, s->xb, w->w1, l * dim * hidden_dim, dim,
+                       hidden_dim);
+                matmul(s->hb2, s->xb, w->w3, l * dim * hidden_dim, dim,
+                       hidden_dim);
+            },
+            2);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -663,8 +708,10 @@ float* forward(Transformer* transformer, int token, int pos) {
             s->hb[i] = val;
         }
 
-        // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2, l * dim * hidden_dim, hidden_dim, dim);
+        prof("matmul1", [&] {
+            // final matmul to get the output of the ffn
+            matmul(s->xb, s->hb, w->w2, l * dim * hidden_dim, hidden_dim, dim);
+        });
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -673,10 +720,12 @@ float* forward(Transformer* transformer, int token, int pos) {
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, 0, dim);
+    prof("rmsnorm1", [&] { rmsnorm(x, x, w->rms_final_weight, 0, dim); });
     // classifier into logits
-    matmul(s->logits, x, w->wcls, 0, p->dim,
-           p->vocab_size);  // wcls size = p->dim * p->vocab_size = 125M
+    prof("matmul1", [&] {
+        matmul(s->logits, x, w->wcls, 0, p->dim,
+               p->vocab_size);  // wcls size = p->dim * p->vocab_size = 125M
+    });
     return s->logits;
 }
 
@@ -1424,10 +1473,8 @@ int main(int argc, char* argv[]) {
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
                   rng_seed);
-
-    // run!
     profile::reset_all();
-    auto start = get_cycles();
+    // run!
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
@@ -1436,14 +1483,13 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
     }
-    auto end = get_cycles();
-    std::cout << "wall time: " << static_cast<double>(end - start) / 2.8 / 1e3
-              << " us" << std::endl;
-    profile::print_profile_data();
+
     // memory and file handles cleanup
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
+    prof_res_print();
+    profile::print_profile_data();
     // }).print();
     FarLib::runtime_destroy();
 #ifdef STANDALONE

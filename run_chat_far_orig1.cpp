@@ -33,10 +33,10 @@ extern "C" {
 using namespace far_memory;
 using namespace std::chrono_literals;
 
-constexpr uint64_t kCacheGBs = 3;
+constexpr uint64_t kCacheGBs = 72;
 constexpr uint64_t kCacheSize = kCacheGBs << 30;
 constexpr uint64_t kFarMemSize = (32ULL << 30); // 1 GB. Not relevant here.
-constexpr uint64_t kNumGCThreads = 40;
+constexpr uint64_t kNumGCThreads = 16;
 constexpr uint64_t kNumElementsPerScope = 1024;
 constexpr uint64_t kNumConnections = 400;
 
@@ -76,21 +76,6 @@ struct TransformerWeights {
         wo(manager), w1(manager), w2(manager), w3(manager),
         rms_final_weight(manager), wcls(manager) {}
 
-  void prepare_prefetch(size_t mutator_count) {
-    token_embedding_table.prepare_multi_prefetch(mutator_count);
-    rms_att_weight.prepare_multi_prefetch(mutator_count);
-    rms_ffn_weight.prepare_multi_prefetch(mutator_count);
-    wq.prepare_multi_prefetch(mutator_count);
-    wk.prepare_multi_prefetch(mutator_count);
-    wv.prepare_multi_prefetch(mutator_count);
-    wo.prepare_multi_prefetch(mutator_count);
-    w1.prepare_multi_prefetch(mutator_count);
-    w2.prepare_multi_prefetch(mutator_count);
-    w3.prepare_multi_prefetch(mutator_count);
-    rms_final_weight.prepare_multi_prefetch(mutator_count);
-    wcls.prepare_multi_prefetch(mutator_count);
-  }
-
   void free() {
     // token_embedding_table.cleanup();
     // rms_att_weight.cleanup();
@@ -115,34 +100,23 @@ struct RunState {
   float *hb;     // buffer for hidden dimension in the ffn (hidden_dim,)
   float *hb2;    // buffer for hidden dimension in the ffn (hidden_dim,)
   float *q;      // query (dim,)
-  float *k;      // key (dim,)
-  float *v;      // value (dim,)
   float *att;    // buffer for scores/attention values (n_heads, seq_len)
   float *logits; // output logits
   // kv cache
-  float *key_cache;   // (layer, seq_len, dim)
-  float *value_cache; // (layer, seq_len, dim)
+  DataFrameVector<float> key_cache;   // (layer, seq_len, dim)
+  DataFrameVector<float> value_cache; // (layer, seq_len, dim)
+
+  RunState(FarMemManager *manager) : key_cache(manager), value_cache(manager) {}
 };
 
 static constexpr bool MULTITHREAD_ENABLE =
-    true; // DataFrameVector<float>::MULTITHREAD_ENABLE;
+    DataFrameVector<float>::MULTITHREAD_ENABLE;
 static constexpr size_t UTHREAD_FACTOR =
     8; //  DataFrameVector<float>::UTHREAD_FACTOR;
 static inline size_t get_thread_count() {
   // return 1;
   return MULTITHREAD_ENABLE ? need_perf_thread_count * UTHREAD_FACTOR : 1;
 }
-
-// ----------------------------------------------------------------------------
-// utilities: time
-
-long time_in_ms() {
-  // return time in milliseconds, for benchmarking the model speed
-  struct timespec time;
-  clock_gettime(CLOCK_REALTIME, &time);
-  return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
 struct Transformer {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
@@ -152,7 +126,7 @@ struct Transformer {
   float *data;       // memory mapped data pointer
   ssize_t file_size; // size of the checkpoint file in bytes
 
-  Transformer(FarMemManager *manager) : weights(manager) {}
+  Transformer(FarMemManager *manager) : state(manager), weights(manager) {}
 };
 
 void malloc_run_state(RunState *s, Config *p) {
@@ -174,16 +148,16 @@ void malloc_run_state(RunState *s, Config *p) {
       p->n_layers * p->seq_len * kv_dim; // 1G for llama-7b-chat
   const size_t value_cache_size =
       p->n_layers * p->seq_len * kv_dim; // 1G for llama-7b-chat
-  s->key_cache = static_cast<float *>(calloc(key_cache_size, sizeof(float)));
-  s->value_cache =
-      static_cast<float *>(calloc(value_cache_size, sizeof(float)));
+  s->key_cache.resize(key_cache_size);
+  s->value_cache.resize(value_cache_size);
   s->att = static_cast<float *>(
       calloc(p->n_heads * p->seq_len, sizeof(float))); // 256K for llama-7b-chat
   s->logits = static_cast<float *>(
       calloc(p->vocab_size, sizeof(float))); // 125K for llama-7b-chat
   // ensure all mallocs went fine
   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
-      !s->key_cache || !s->value_cache || !s->att || !s->logits) {
+      s->key_cache.size() != key_cache_size ||
+      s->value_cache.size() != value_cache_size || !s->att || !s->logits) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
   }
@@ -198,8 +172,8 @@ void free_run_state(RunState *s) {
   free(s->q);
   free(s->att);
   free(s->logits);
-  free(s->key_cache);
-  free(s->value_cache);
+  s->key_cache.cleanup();
+  // s->value_cache.cleanup();
 }
 
 void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
@@ -257,7 +231,6 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
   ptr += rms_final_weight_size;
   w->wcls.assign_locally(shared_weights ? token_embedding_table_ptr : ptr,
                          wcls_size);
-  w->prepare_prefetch(get_thread_count());
 }
 
 void read_checkpoint(const char *checkpoint, Config *config,
@@ -389,7 +362,7 @@ void rmsnorm(float *o, float *x, DataFrameVector<float> &weight_fv,
         return;
       }
       DerefScope scope;
-      auto it = weight_fv.cfpbegin(scope, tid) + idx_start;
+      auto it = weight_fv.cfbegin(scope) + idx_start;
       for (size_t oi = o_start; oi < o_end; oi++, ++it) {
         if (unlikely((oi - o_start) % weight_fv.kNumElementsPerScope == 0)) {
           scope.renew();
@@ -447,7 +420,7 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   // helpers::safe_printf("%s matmul n = %d, d = %d\n", name, n, d);
-  size_t mstart = time_in_ms();
+  size_t mstart = get_cycles();
   const size_t thread_cnt = get_thread_count();
   const size_t block = (d + thread_cnt - 1) / thread_cnt;
   std::vector<rt::Thread> threads;
@@ -455,7 +428,7 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
   threads.reserve(thread_cnt);
   for (int tid = 0; tid < thread_cnt; tid++) {
     threads.emplace_back([&, tid] {
-      auto tstart = time_in_ms();
+      auto tstart = get_cycles();
       const size_t d_start = tid * block;
       const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
       const size_t idx_start = wstart + d_start * n;
@@ -464,7 +437,7 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
         return;
       }
       DerefScope scope;
-      auto it = weight_fv.cfpbegin(scope, tid) + idx_start;
+      auto it = weight_fv.cfbegin(scope) + idx_start;
       for (size_t dd = d_start; dd < d_end; dd++) {
         float val = 0.0f;
         for (size_t j = 0; j < n; j++, ++it) {
@@ -478,76 +451,78 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
         }
         xout[dd] = val;
       }
-      auto tend = time_in_ms();
+      auto tend = get_cycles();
       th_times[tid] = tend - tstart;
     });
   }
   for (auto &t : threads) {
     t.Join();
   }
-  size_t mend = time_in_ms();
-  helpers::safe_printf("thread time min = %lu ms\n",
-                       *std::min_element(th_times.begin(), th_times.end()));
-  helpers::safe_printf("thread time max = %lu ms\n",
-                       *std::max_element(th_times.begin(), th_times.end()));
-  helpers::safe_printf("m time: %ld ms\n", mend - mstart);
+  size_t mend = get_cycles();
+  // helpers::safe_printf("thread time min = %lu\n",
+  //                      *std::min_element(th_times.begin(), th_times.end()));
+  // helpers::safe_printf("thread time max = %lu\n",
+  //                      *std::max_element(th_times.begin(), th_times.end()));
+  // helpers::safe_printf("m time: %f\n",
+  //                      static_cast<double>(mend - mstart) / 2.8);
 }
 
-// void matmul(DataFrameVector<float> &xout_fv, size_t xout_start, float *x,
-//             DataFrameVector<float> &weight_fv, size_t wstart, int n, int d,
-//             const char *name = "") {
-//   // W (d,n) @ x (n,) -> xout (d,)
-//   // by far the most amount of time is spent inside this little function
-//   // helpers::safe_printf("%s matmul n = %d, d = %d\n", name, n, d);
-//   const size_t thread_cnt = get_thread_count();
-//   const size_t block = (d + thread_cnt - 1) / thread_cnt;
-//   size_t mstart = time_in_ms();
-//   std::vector<rt::Thread> threads;
-//   std::vector<size_t> th_times(thread_cnt);
-//   threads.reserve(thread_cnt);
-//   for (int tid = 0; tid < thread_cnt; tid++) {
-//     threads.emplace_back([&, tid] {
-//       auto tstart = time_in_ms();
-//       const size_t d_start = tid * block;
-//       const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
-//       const size_t out_start = xout_start + d_start;
-//       const size_t out_end = xout_start + d_end;
-//       if (d_start >= d_end) {
-//         return;
-//       }
-//       DerefScope scope;
-//       auto out_it = xout_fv.fpbegin(scope, tid) + out_start;
-//       for (size_t dd = d_start; dd < d_end; dd++, ++out_it) {
-//         float val = 0.0f;
-//         const size_t idx_start = wstart + dd * n;
-//         const size_t idx_end = wstart + (dd + 1) * n;
-//         auto w_it = weight_fv.cfpbegin(scope, tid) + idx_start;
-//         for (size_t j = 0; j < n; j++, ++w_it) {
-//           if (unlikely(((dd - d_start) * n + j) %
-//                            weight_fv.kNumElementsPerScope ==
-//                        0)) {
-//             scope.renew();
-//             out_it.renew(scope);
-//             w_it.renew(scope);
-//           }
-//           val += *w_it * x[j];
-//         }
-//         *out_it = val;
-//       }
-//       auto tend = time_in_ms();
-//       th_times[tid] = tend - tstart;
-//     });
-//   }
-//   for (auto &t : threads) {
-//     t.Join();
-//   }
-//   size_t mend = time_in_ms();
-//   helpers::safe_printf("thread time min = %lu ms\n",
-//                        *std::min_element(th_times.begin(), th_times.end()));
-//   helpers::safe_printf("thread time max = %lu ms\n",
-//                        *std::max_element(th_times.begin(), th_times.end()));
-//   helpers::safe_printf("m2 time: %ld ms\n", mend - mstart);
-// }
+void matmul(DataFrameVector<float> &xout_fv, size_t xout_start, float *x,
+            DataFrameVector<float> &weight_fv, size_t wstart, int n, int d,
+            const char *name = "") {
+  // W (d,n) @ x (n,) -> xout (d,)
+  // by far the most amount of time is spent inside this little function
+  // helpers::safe_printf("%s matmul n = %d, d = %d\n", name, n, d);
+  const size_t thread_cnt = get_thread_count();
+  const size_t block = (d + thread_cnt - 1) / thread_cnt;
+  size_t mstart = get_cycles();
+  std::vector<rt::Thread> threads;
+  std::vector<size_t> th_times(thread_cnt);
+  threads.reserve(thread_cnt);
+  for (int tid = 0; tid < thread_cnt; tid++) {
+    threads.emplace_back([&, tid] {
+      auto tstart = get_cycles();
+      const size_t d_start = tid * block;
+      const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
+      const size_t out_start = xout_start + d_start;
+      const size_t out_end = xout_start + d_end;
+      if (d_start >= d_end) {
+        return;
+      }
+      DerefScope scope;
+      auto out_it = xout_fv.fbegin(scope) + out_start;
+      for (size_t dd = d_start; dd < d_end; dd++, ++out_it) {
+        float val = 0.0f;
+        const size_t idx_start = wstart + dd * n;
+        const size_t idx_end = wstart + (dd + 1) * n;
+        auto w_it = weight_fv.cfbegin(scope) + idx_start;
+        for (size_t j = 0; j < n; j++, ++w_it) {
+          if (unlikely(((dd - d_start) * n + j) %
+                           weight_fv.kNumElementsPerScope ==
+                       0)) {
+            scope.renew();
+            out_it.renew(scope);
+            w_it.renew(scope);
+          }
+          val += *w_it * x[j];
+        }
+        *out_it = val;
+      }
+      auto tend = get_cycles();
+      th_times[tid] = tend - tstart;
+    });
+  }
+  for (auto &t : threads) {
+    t.Join();
+  }
+  size_t mend = get_cycles();
+  // helpers::safe_printf("thread time min = %lu\n",
+  //                      *std::min_element(th_times.begin(), th_times.end()));
+  // helpers::safe_printf("thread time max = %lu\n",
+  //                      *std::max_element(th_times.begin(), th_times.end()));
+  // helpers::safe_printf("m2 time: %f\n",
+  //                      static_cast<double>(mend - mstart) / 2.8);
+}
 
 float *forward(Transformer *transformer, int token, int pos) {
   // a few convenience variables
@@ -577,11 +552,11 @@ float *forward(Transformer *transformer, int token, int pos) {
     // qkv matmuls for this position
     const size_t key_cache_start = loff + pos * kv_dim;
     const size_t value_cache_start = loff + pos * kv_dim;
-    s->k = s->key_cache + loff + pos * kv_dim;
-    s->v = s->value_cache + loff + pos * kv_dim;
     matmul(s->q, s->xb, w->wq, l * dim * dim, dim, dim, "q & xb");
-    matmul(s->k, s->xb, w->wk, l * dim * kv_dim, dim, kv_dim, "k & xb");
-    matmul(s->v, s->xb, w->wv, l * dim * kv_dim, dim, kv_dim, "v & xb");
+    matmul(s->key_cache, loff + pos * kv_dim, s->xb, w->wk, l * dim * kv_dim,
+           dim, kv_dim, "k & xb");
+    matmul(s->value_cache, loff + pos * kv_dim, s->xb, w->wv, l * dim * kv_dim,
+           dim, kv_dim, "v & xb");
 
     // RoPE relative positional encoding: complex-valued rotate q and k in
     // each head
@@ -599,18 +574,27 @@ float *forward(Transformer *transformer, int token, int pos) {
           if (idx_start >= idx_end) {
             return;
           }
-          for (int i = idx_start; i < idx_end; i += 2) {
+          DerefScope scope;
+          auto it = s->key_cache.fbegin(scope) + key_cache_start + idx_start;
+          auto it1 =
+              s->key_cache.fbegin(scope) + key_cache_start + idx_start + 1;
+          for (int i = idx_start; i < idx_end; i += 2, it += 2, it1 += 2) {
+            if (unlikely((i - idx_start) % s->key_cache.kNumElementsPerScope ==
+                         0)) {
+              scope.renew();
+              it.renew(scope);
+              it1.renew(scope);
+            }
             int head_dim = i % head_size;
             float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
             float val = pos * freq;
             float fcr = cosf(val);
             float fci = sinf(val);
 
-            float *vec = s->k;
-            float v0 = vec[i];
-            float v1 = vec[i + 1];
-            vec[i] = v0 * fcr - v1 * fci;
-            vec[i + 1] = v0 * fci + v1 * fcr;
+            float v0 = *it;
+            float v1 = *it1;
+            *it = v0 * fcr - v1 * fci;
+            *it1 = v0 * fci + v1 * fcr;
           }
         });
       }
@@ -656,13 +640,20 @@ float *forward(Transformer *transformer, int token, int pos) {
           // iterate over all timesteps, including the current one
           for (int t = 0; t <= pos; t++) {
             // get the key vector for this head and at this timestep
-            float *k =
-                s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+            const size_t key_cache_base =
+                loff + t * kv_dim + (h / kv_mul) * head_size;
+            auto it = s->key_cache.cfbegin(scope) + key_cache_base;
             // calculate the attention score as the dot
             // product of q and k
             float score = 0.0f;
-            for (int i = 0; i < head_size; i++) {
-              score += q[i] * k[i];
+            for (int i = 0; i < head_size; i++, ++it) {
+              if (unlikely((t * head_size + i) %
+                               s->key_cache.kNumElementsPerScope ==
+                           0)) {
+                scope.renew();
+                it.renew(scope);
+              }
+              score += q[i] * (*it);
             }
             score /= sqrtf(head_size);
             // save the score to the attention buffer
@@ -678,13 +669,20 @@ float *forward(Transformer *transformer, int token, int pos) {
           for (int t = 0; t <= pos; t++) {
             // get the value vector for this head and at this
             // timestep
-            float *v =
-                s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+            const size_t value_cache_base =
+                loff + t * kv_dim + (h / kv_mul) * head_size;
+            auto it = s->value_cache.cfbegin(scope) + value_cache_base;
             // get the attention weight for this timestep
             float a = att[t];
             // accumulate the weighted value into xb
-            for (int i = 0; i < head_size; i++) {
-              xb[i] += a * v[i];
+            for (int i = 0; i < head_size; i++, ++it) {
+              if (unlikely((t * head_size + i) %
+                               s->value_cache.kNumElementsPerScope ==
+                           0)) {
+                scope.renew();
+                it.renew(scope);
+              }
+              xb[i] += a * (*it);
             }
           }
         }
@@ -1145,6 +1143,16 @@ int sample(Sampler *sampler, float *logits) {
     }
   }
   return next;
+}
+
+// ----------------------------------------------------------------------------
+// utilities: time
+
+long time_in_ms() {
+  // return time in milliseconds, for benchmarking the model speed
+  struct timespec time;
+  clock_gettime(CLOCK_REALTIME, &time);
+  return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
 // ----------------------------------------------------------------------------

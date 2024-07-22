@@ -37,4 +37,7 @@ link_libraries(nl-3 nl-route-3)
 # Link libnuma.
 link_libraries(numa)
 
+# link papi
+link_libraries(papi)
+
 add_executable(run_chat_far run_chat_far.cpp)

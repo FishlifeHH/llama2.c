@@ -91,6 +91,36 @@ struct TransformerWeights {
     wcls.prepare_multi_prefetch(mutator_count);
   }
 
+  void enable_debug() {
+    token_embedding_table.enable_debug();
+    rms_att_weight.enable_debug();
+    rms_ffn_weight.enable_debug();
+    wq.enable_debug();
+    wk.enable_debug();
+    wv.enable_debug();
+    wo.enable_debug();
+    w1.enable_debug();
+    w2.enable_debug();
+    w3.enable_debug();
+    rms_final_weight.enable_debug();
+    wcls.enable_debug();
+  }
+
+  void disable_debug() {
+    token_embedding_table.disable_debug();
+    rms_att_weight.disable_debug();
+    rms_ffn_weight.disable_debug();
+    wq.disable_debug();
+    wk.disable_debug();
+    wv.disable_debug();
+    wo.disable_debug();
+    w1.disable_debug();
+    w2.disable_debug();
+    w3.disable_debug();
+    rms_final_weight.disable_debug();
+    wcls.disable_debug();
+  }
+
   void free() {
     // token_embedding_table.cleanup();
     // rms_att_weight.cleanup();
@@ -565,7 +595,6 @@ float *forward(Transformer *transformer, int token, int pos) {
 
   // copy the token embedding into x
   w->token_embedding_table.copy_to_local(x, token * dim, dim);
-
   // forward all the layers
   for (unsigned long long l = 0; l < p->n_layers; l++) {
     // attention rmsnorm
@@ -579,10 +608,11 @@ float *forward(Transformer *transformer, int token, int pos) {
     const size_t value_cache_start = loff + pos * kv_dim;
     s->k = s->key_cache + loff + pos * kv_dim;
     s->v = s->value_cache + loff + pos * kv_dim;
+    // w->enable_debug();
     matmul(s->q, s->xb, w->wq, l * dim * dim, dim, dim, "q & xb");
     matmul(s->k, s->xb, w->wk, l * dim * kv_dim, dim, kv_dim, "k & xb");
     matmul(s->v, s->xb, w->wv, l * dim * kv_dim, dim, kv_dim, "v & xb");
-
+    // w->disable_debug();
     // RoPE relative positional encoding: complex-valued rotate q and k in
     // each head
     {
@@ -733,7 +763,6 @@ float *forward(Transformer *transformer, int token, int pos) {
       x[i] += s->xb[i];
     }
   }
-
   // final rmsnorm
   rmsnorm(x, x, w->rms_final_weight, 0, dim);
 

@@ -1,8 +1,10 @@
 /* Inference for Llama-2 Transformer model in pure C */
 
+#define _GNU_SOURCE
 #include <ctype.h>
 #include <fcntl.h>
 #include <math.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,16 +14,27 @@
 #include "win.h"
 #else
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 // ----------------------------------------------------------------------------
 // Transformer model
-
+// static size_t multi_count = 0;
+static const size_t PAGE_ALIGN = 4 << 10;
 typedef unsigned long long Time_t;
 static Time_t get_cycles() {
     unsigned int t;
     return __rdtscp(&t);
 }
+// ----------------------------------------------------------------------------
+// utilities: time
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
 typedef struct {
     int dim;         // transformer dimension
     int hidden_dim;  // for ffn layers
@@ -84,7 +97,29 @@ typedef struct {
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    const size_t x_mem_size = p->dim * sizeof(float);
+    const size_t xb_mem_size = x_mem_size;
+    const size_t xb2_mem_size = xb_mem_size;
+    const size_t hb_mem_size = p->hidden_dim * sizeof(float);
+    const size_t hb2_mem_size = hb_mem_size;
+    const size_t q_mem_size = p->dim * sizeof(float);
+    const size_t att_mem_size = p->n_heads * p->seq_len * sizeof(float);
+    const size_t logits_mem_size = p->vocab_size * sizeof(float);
+    const size_t key_cache_mem_size =
+        p->n_layers * p->seq_len * kv_dim * sizeof(float);
+    const size_t value_cache_mem_size =
+        p->n_layers * p->seq_len * kv_dim * sizeof(float);
+    // s->x = aligned_alloc(PAGE_ALIGN, x_mem_size);
+    // s->xb = aligned_alloc(PAGE_ALIGN, xb_mem_size);
+    // s->xb2 = aligned_alloc(PAGE_ALIGN, xb2_mem_size);
+    // s->hb = aligned_alloc(PAGE_ALIGN, hb_mem_size);
+    // s->hb2 = aligned_alloc(PAGE_ALIGN, hb2_mem_size);
+    // s->q = aligned_alloc(PAGE_ALIGN, q_mem_size);
+    // s->key_cache = aligned_alloc(PAGE_ALIGN, key_cache_mem_size);
+    // s->value_cache = aligned_alloc(PAGE_ALIGN, value_cache_mem_size);
+    // s->att = aligned_alloc(PAGE_ALIGN, att_mem_size);
+    // s->logits = aligned_alloc(PAGE_ALIGN, logits_mem_size);
     s->x = calloc(p->dim, sizeof(float));
     s->xb = calloc(p->dim, sizeof(float));
     s->xb2 = calloc(p->dim, sizeof(float));
@@ -101,6 +136,16 @@ void malloc_run_state(RunState* s, Config* p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
+    mlock(s->x, x_mem_size);
+    mlock(s->xb, xb_mem_size);
+    mlock(s->xb2, xb2_mem_size);
+    mlock(s->hb, hb_mem_size);
+    mlock(s->hb2, hb2_mem_size);
+    mlock(s->q, q_mem_size);
+    mlock(s->att, att_mem_size);
+    mlock(s->logits, logits_mem_size);
+    mlock(s->key_cache, key_cache_mem_size);
+    mlock(s->value_cache, value_cache_mem_size);
 }
 
 void free_run_state(RunState* s) {
@@ -122,28 +167,52 @@ void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
     // make sure the multiplications below are done in 64bit to fit the
     // parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
+    const size_t token_embedding_table_size = p->vocab_size * p->dim;
+    const size_t rms_att_weight_size = n_layers * p->dim;
+    const size_t wq_size = n_layers * p->dim * (p->n_heads * head_size);
+    const size_t wk_size = n_layers * p->dim * (p->n_kv_heads * head_size);
+    const size_t wv_size = n_layers * p->dim * (p->n_kv_heads * head_size);
+    const size_t wo_size = n_layers * (p->n_heads * head_size) * p->dim;
+    const size_t rms_ffn_weight_size = n_layers * p->dim;
+    const size_t w1_size = n_layers * p->dim * p->hidden_dim;
+    const size_t w2_size = n_layers * p->hidden_dim * p->dim;
+    const size_t w3_size = n_layers * p->dim * p->hidden_dim;
+    const size_t rms_final_weight_size = p->dim;
+    const size_t wcls_size = p->dim * p->vocab_size;
+    // printf("token_embedding_table_size = %zu\n", token_embedding_table_size);
+    // printf("rms_att_weight_size = %zu\n", rms_att_weight_size);
+    // printf("wq_size = %zu\n", wq_size);
+    // printf("wk_size = %zu\n", wk_size);
+    // printf("wv_size = %zu\n", wv_size);
+    // printf("wo_size = %zu\n", wo_size);
+    // printf("rms_ffn_weight_size = %zu\n", rms_ffn_weight_size);
+    // printf("w1_size = %zu\n", w1_size);
+    // printf("w2_size = %zu\n", w2_size);
+    // printf("w3_size = %zu\n", w3_size);
+    // printf("wq_size = %zu\n", wq_size);
+    // printf("rms_final_weight_size = %zu\n", rms_final_weight_size);
     w->token_embedding_table = ptr;
-    ptr += p->vocab_size * p->dim;
+    ptr += token_embedding_table_size;
     w->rms_att_weight = ptr;
-    ptr += n_layers * p->dim;
+    ptr += rms_att_weight_size;
     w->wq = ptr;
-    ptr += n_layers * p->dim * (p->n_heads * head_size);
+    ptr += wq_size;
     w->wk = ptr;
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    ptr += wk_size;
     w->wv = ptr;
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    ptr += wv_size;
     w->wo = ptr;
-    ptr += n_layers * (p->n_heads * head_size) * p->dim;
+    ptr += wo_size;
     w->rms_ffn_weight = ptr;
-    ptr += n_layers * p->dim;
+    ptr += rms_ffn_weight_size;
     w->w1 = ptr;
-    ptr += n_layers * p->dim * p->hidden_dim;
+    ptr += w1_size;
     w->w2 = ptr;
-    ptr += n_layers * p->hidden_dim * p->dim;
+    ptr += w2_size;
     w->w3 = ptr;
-    ptr += n_layers * p->dim * p->hidden_dim;
+    ptr += w3_size;
     w->rms_final_weight = ptr;
-    ptr += p->dim;
+    ptr += rms_final_weight_size;
     ptr += p->seq_len * head_size /
            2;  // skip what used to be freq_cis_real (for RoPE)
     ptr += p->seq_len * head_size /
@@ -178,12 +247,25 @@ void read_checkpoint(char* checkpoint, Config* config,
         exit(EXIT_FAILURE);
     }
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+
     if (*data == MAP_FAILED) {
         fprintf(stderr, "mmap failed!\n");
         exit(EXIT_FAILURE);
     }
-    float* weights_ptr = *data + sizeof(Config) / sizeof(float);
+    float* ptr = (float*)(aligned_alloc(PAGE_ALIGN, *file_size));
+    printf("start memmove, mem size = %f\n",
+           (double)(*file_size) / (1024 * 1024 * 1024L));
+    fflush(stdout);
+    memmove(ptr, *data, *file_size);
+    printf("end memmove\n");
+    fflush(stdout);
+    float* weights_ptr = (float*)(ptr + sizeof(Config) / sizeof(float));
     memory_map_weights(weights, config, weights_ptr, shared_weights);
+    if (munmap(*data, *file_size)) {
+        fprintf(stderr, "mmap failed!\n");
+        exit(EXIT_FAILURE);
+    }
+    *data = MAP_FAILED;  // avoid double unmap
 }
 
 void build_transformer(Transformer* t, char* checkpoint_path) {
@@ -211,6 +293,7 @@ void free_transformer(Transformer* t) {
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
+    // printf("rmsnorm size: %d\n", size);
     float ss = 0.0f;
     for (int j = 0; j < size; j++) {
         ss += x[j] * x[j];
@@ -219,9 +302,16 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
     // normalize and scale
-    for (int j = 0; j < size; j++) {
+    int j;
+    // printf("rmsnorm size: %d\n", size);
+    // size_t rm_start = get_cycles();
+    // multi_count++;
+#pragma omp parallel for private(j)
+    for (j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
+    // size_t rm_end = get_cycles();
+    // printf("rm time: %f\n", (double)(rm_end - rm_start) / 2.8);
 }
 
 void softmax(float* x, int size) {
@@ -244,11 +334,20 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
+void matmul(float* xout, const float* x, const float* w, const int n,
+            const int d, const char* xout_name, const char* x_name,
+            const char* w_name) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
-#pragma omp parallel for private(i) num_threads(16)
+    // printf("matmul n = %d, d: %d\n", n, d);
+    long mstart = time_in_ms();
+    // printf("matmul range: \n");
+    // printf("%s: %p ~ %p\n", xout_name, xout, xout + d);
+    // printf("%s: %p ~ %p\n", x_name, x, x + n);
+    // printf("%s: %p ~ %p\n", w_name, w, w + d * n);
+    // multi_count++;
+#pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -256,6 +355,9 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
+    long mend = time_in_ms();
+    // printf("mtime: %ld ms\n", mend - mstart);
+    // printf("swap: %f ms\n", (double)(swap_end - swap_start) / 3.5 / 1e6);
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
@@ -288,34 +390,49 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+        matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim, "s->q", "s->xb",
+               "w->wq");
+        matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim, "s->k",
+               "s->xb", "w->wk");
+        matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim, "s->v",
+               "s->xb", "w->wv");
 
         // RoPE relative positional encoding: complex-valued rotate q and k in
         // each head
-        for (int i = 0; i < dim; i += 2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            int rotn =
-                i < kv_dim ? 2 : 1;  // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0
-                                 ? s->q
-                                 : s->k;  // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i + 1];
-                vec[i] = v0 * fcr - v1 * fci;
-                vec[i + 1] = v0 * fci + v1 * fcr;
+        {
+            int i;
+            // printf("forward dim: %d\n", dim);
+            // size_t dim_start = get_cycles();
+            // multi_count++;
+#pragma omp parallel for private(i)
+            for (i = 0; i < dim; i += 2) {
+                int head_dim = i % head_size;
+                float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+                float val = pos * freq;
+                float fcr = cosf(val);
+                float fci = sinf(val);
+                int rotn = i < kv_dim
+                               ? 2
+                               : 1;  // how many vectors? 2 = q & k, 1 = q only
+                for (int v = 0; v < rotn; v++) {
+                    float* vec =
+                        v == 0 ? s->q
+                               : s->k;  // the vector to rotate (query or key)
+                    float v0 = vec[i];
+                    float v1 = vec[i + 1];
+                    vec[i] = v0 * fcr - v1 * fci;
+                    vec[i + 1] = v0 * fci + v1 * fcr;
+                }
             }
+            // size_t dim_end = get_cycles();
+            // printf("dim time: %f\n", (double)(dim_end - dim_start) / 2.8);
         }
-
         // multihead attention. iterate over all heads
         int h;
-#pragma omp parallel for private(h) num_threads(16)
+        // printf("n heads: %zu\n", p->n_heads);
+        // size_t hstart = get_cycles();
+        // multi_count++;
+#pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
             float* q = s->q + h * head_size;
@@ -355,9 +472,11 @@ float* forward(Transformer* transformer, int token, int pos) {
                 }
             }
         }
-
+        // size_t hend = get_cycles();
+        // printf("htime: %f\n", (double)(hend - hstart) / 2.8);
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+        matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim, "s->xb2",
+               "s->xb", "w->wo");
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -369,8 +488,10 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) *
         // self.w3(x)) first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim,
+               "s->hb", "s->xb", "w->w1");
+        matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim,
+               "s->hb2", "s->xb", "s->w3");
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -383,7 +504,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim,
+               "s->xb", "s->hb", "w->w2");
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -395,7 +517,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size, "s->logits", "x",
+           "w->wcls");
     return s->logits;
 }
 
@@ -424,8 +547,14 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     // i should have written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
     // malloc space to hold the scores and the strings
-    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
-    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
+    const size_t vocab_mem_size = vocab_size * sizeof(char*);
+    const size_t vocab_scores_mem_size = vocab_size * sizeof(float);
+    t->vocab = (char**)aligned_alloc(PAGE_ALIGN, vocab_mem_size);
+    t->vocab_scores = (float*)aligned_alloc(PAGE_ALIGN, vocab_scores_mem_size);
+    // printf("vocab size: %zu\n", vocab_mem_size);
+    // printf("vocab_scores size: %zu\n", vocab_scores_mem_size);
+    mlock(t->vocab, vocab_mem_size);
+    mlock(t->vocab_scores, vocab_scores_mem_size);
     t->sorted_vocab = NULL;  // initialized lazily
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
@@ -452,6 +581,7 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
             exit(EXIT_FAILURE);
         }
         t->vocab[i] = (char*)malloc(len + 1);
+        mlock(t->vocab[i], len + 1);
         if (fread(t->vocab[i], len, 1, file) != 1) {
             fprintf(stderr, "failed read\n");
             exit(EXIT_FAILURE);
@@ -523,22 +653,30 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
         fprintf(stderr, "cannot encode NULL text\n");
         exit(EXIT_FAILURE);
     }
+    const size_t str_buffer_mem_size =
+        (t->max_token_length * 2 + 1 + 2) * sizeof(char);
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        const size_t sorted_vocab_mem_size = t->vocab_size * sizeof(TokenIndex);
+        t->sorted_vocab = aligned_alloc(PAGE_ALIGN, sorted_vocab_mem_size);
+        // printf("sorted_vocab size: %zu\n", sorted_vocab_mem_size);
+        mlock(t->sorted_vocab, sorted_vocab_mem_size);
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
         }
         qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex),
               compare_tokens);
+        // printf("str_buffer_mem_size: %zu\n", str_buffer_mem_size);
     }
 
     // create a temporary buffer that will store merge candidates of always two
     // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
     // case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+    // char* str_buffer = malloc((t->max_token_length * 2 + 1 + 2) *
+    // sizeof(char));
+    char str_buffer[64];
     size_t str_len = 0;
 
     // start at 0 tokens
@@ -647,7 +785,7 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
     // add optional EOS (=2) token, if desired
     if (eos) tokens[(*n_tokens)++] = 2;
 
-    free(str_buffer);
+    // free(str_buffer);
 }
 
 // ----------------------------------------------------------------------------
@@ -752,10 +890,17 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature,
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    const size_t probindex_mem_size = sampler->vocab_size * sizeof(ProbIndex);
+    // printf("probindex_mem_size: %zu\n", probindex_mem_size);
+    sampler->probindex = aligned_alloc(PAGE_ALIGN, probindex_mem_size);
+    mlock(sampler->probindex, probindex_mem_size);
 }
 
-void free_sampler(Sampler* sampler) { free(sampler->probindex); }
+void free_sampler(Sampler* sampler) {
+    const size_t probindex_mem_size = sampler->vocab_size * sizeof(ProbIndex);
+    munlock(sampler->probindex, probindex_mem_size);
+    free(sampler->probindex);
+}
 
 unsigned int random_u32(unsigned long long* state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
@@ -795,16 +940,6 @@ int sample(Sampler* sampler, float* logits) {
         }
     }
     return next;
-}
-
-// ----------------------------------------------------------------------------
-// utilities: time
-
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
 // ----------------------------------------------------------------------------
@@ -898,24 +1033,42 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
 
+#define SYSTEM_PROMPT_SIZE (512)
+#define USER_PROMPT_SIZE (512)
+#define RENDERED_PROMPT_SIZE (1152)
+#define SYSTEM_PROMPT_MEM_SIZE (SYSTEM_PROMPT_SIZE * sizeof(char))
+#define USER_PROMPT_MEM_SIZE (USER_PROMPT_SIZE * sizeof(char))
+#define RENDERED_PROMPT_MEM_SIZE (RENDERED_PROMPT_SIZE * sizeof(char))
+#define PROMPT_TOKENS_SIZE (1152)
+#define PROMPT_TOKENS_MEM_SIZE (PROMPT_TOKENS_SIZE * sizeof(int))
 void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
           char* cli_user_prompt, char* cli_system_prompt, int steps) {
     // buffers for reading the system prompt and user prompt from stdin
     // you'll notice they are soomewhat haphazardly and unsafely set atm
-    char system_prompt[512];
-    char user_prompt[512];
-    char rendered_prompt[1152];
+    char system_prompt[SYSTEM_PROMPT_SIZE];
+    char user_prompt[USER_PROMPT_SIZE];
+    char rendered_prompt[RENDERED_PROMPT_SIZE];
     int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
+    int* prompt_tokens =
+        (int*)aligned_alloc(PAGE_ALIGN, PROMPT_TOKENS_MEM_SIZE);
     int user_idx;
-
+    printf("SYSTEM_PROMPT_MEM_SIZE: %ld\n", SYSTEM_PROMPT_MEM_SIZE);
+    printf("USER_PROMPT_MEM_SIZE: %ld\n", USER_PROMPT_MEM_SIZE);
+    printf("RENDERED_PROMPT_MEM_SIZE: %ld\n", RENDERED_PROMPT_MEM_SIZE);
+    printf("PROMPT_TOKENS_MEM_SIZE: %ld\n", PROMPT_TOKENS_MEM_SIZE);
+    fflush(stdout);
+    mlock(system_prompt, SYSTEM_PROMPT_MEM_SIZE);
+    mlock(user_prompt, USER_PROMPT_MEM_SIZE);
+    mlock(rendered_prompt, RENDERED_PROMPT_MEM_SIZE);
+    mlock(prompt_tokens, PROMPT_TOKENS_MEM_SIZE);
+    printf("mlock end, start loop\n");
     // start the main loop
     int8_t user_turn = 1;  // user starts
     int next;              // will store the next token in the sequence
     int token;  // stores the current token to feed into the transformer
     int prev_token;
     int pos = 0;  // position in the sequence
-    size_t assistant_t = 0;
+    long assistant_t = 0;
     size_t assistant_tokens = 0;
     while (pos < steps) {
         // when it is the user's turn to contribute tokens to the dialog...
@@ -954,17 +1107,20 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                 char user_template[] = "[INST] %s [/INST]";
                 sprintf(rendered_prompt, user_template, user_prompt);
             }
-            Time_t start = get_cycles();
+            long start = time_in_ms();
+            // Time_t start = get_cycles();
             // encode the rendered prompt into tokens
             encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens,
                    &num_prompt_tokens);
-            Time_t end = get_cycles();
+            // Time_t end = get_cycles();
+            long end = time_in_ms();
             assistant_t += end - start;
             user_idx = 0;  // reset the user index
             user_turn = 0;
             printf("Assistant: ");
         }
-        Time_t start = get_cycles();
+        // Time_t start = get_cycles();
+        long start = time_in_ms();
         // determine the token to pass into the transformer next
         if (user_idx < num_prompt_tokens) {
             // if we are still processing the input prompt, force the next
@@ -995,13 +1151,17 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
         if (next == 2) {
             printf("\n");
         }
-        Time_t end = get_cycles();
+        // Time_t end = get_cycles();
+        long end = time_in_ms();
         assistant_t += end - start;
     }
     printf("\n");
     printf("achieved tok/s: %lf\n",
-           (double)assistant_tokens / (assistant_t / 2.8 / 1e9));
-
+           (double)assistant_tokens / ((double)assistant_t / 1e3));
+    munlock(system_prompt, SYSTEM_PROMPT_MEM_SIZE);
+    munlock(user_prompt, USER_PROMPT_MEM_SIZE);
+    munlock(rendered_prompt, RENDERED_PROMPT_MEM_SIZE);
+    munlock(prompt_tokens, PROMPT_TOKENS_MEM_SIZE);
     free(prompt_tokens);
 }
 
@@ -1028,8 +1188,28 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
+void reset_swap_stats() { syscall(451); }
+
+void report_swap_stats() {
+    int dmd_swapin_num;
+    int prf_swapin_num;
+    int hit_prftch_num;
+    syscall(452, &dmd_swapin_num, &prf_swapin_num, &hit_prftch_num);
+    printf("demand swapin num = %d\n", dmd_swapin_num);
+    printf("prefetch swapin num = %d\n", prf_swapin_num);
+    printf("hit prefetch num = %d\n", hit_prftch_num);
+}
 int main(int argc, char* argv[]) {
     // default parameters
+    // cpu_set_t mask;
+    // CPU_ZERO(&mask);
+    // for (int c = 24;c < 24 + 16;c++) {
+    //     CPU_SET(c, &mask);
+    // }
+    // if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {
+    //     perror("sched failed!\n");
+    //     exit(EXIT_FAILURE);
+    // }
     char* checkpoint_path = NULL;  // e.g. out/model.bin
     char* tokenizer_path = "tokenizer.bin";
     float temperature =
@@ -1092,19 +1272,29 @@ int main(int argc, char* argv[]) {
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
+    mlock(&transformer, sizeof(transformer));
+    printf("transformer size: %zu\n", sizeof(transformer));
+    fflush(stdout);
     if (steps == 0 || steps > transformer.config.seq_len)
         steps = transformer.config.seq_len;  // override to ~max length
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
-
+    printf("tokenizer size: %zu\n", sizeof(tokenizer));
+    fflush(stdout);
+    mlock(&tokenizer, sizeof(tokenizer));
     // build the Sampler
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
                   rng_seed);
-
+    printf("sampler size: %zu\n", sizeof(sampler));
+    fflush(stdout);
+    mlock(&sampler, sizeof(sampler));
     // run!
+    reset_swap_stats();
+    long chat_start = time_in_ms();
+    // long swap_start = syscall(450);
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
@@ -1113,11 +1303,22 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
     }
-
-    // memory and file handles cleanup
+    // long swap_end = syscall(450);
+    long chat_end = time_in_ms();
+    report_swap_stats();
+    printf("chat time: %ld ms\n", chat_end - chat_start);
+    // printf("swap time: %f ms\n", (double)(swap_end - swap_start) / 3.5 /
+    // 1e6); memory and file handles cleanup
+    munlock(&transformer, sizeof(transformer));
+    munlock(&tokenizer, sizeof(tokenizer));
+    munlock(&sampler, sizeof(sampler));
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
+    // printf("multi count %zu\n", multi_count);
+    // long swap_ticks = swap_end - swap_start;
+    // printf("syscall tick = %lu\n", swap_ticks);
+    // printf("syscall time: %f(ms)\n", (double)(swap_ticks) / 3.5 / 1e6);
     return 0;
 }
 #endif

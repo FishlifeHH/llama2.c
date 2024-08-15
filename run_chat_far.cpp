@@ -3,9 +3,11 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <math.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <x86intrin.h>
 
@@ -93,11 +95,13 @@ typedef struct {
     float* hb;      // buffer for hidden dimension in the ffn (hidden_dim,)
     float* hb2;     // buffer for hidden dimension in the ffn (hidden_dim,)
     float* q;       // query (dim,)
+    float* k;       // key (dim,)
+    float* v;       // value (dim,)
     float* att;     // buffer for scores/attention values (n_heads, seq_len)
     float* logits;  // output logits
     // kv cache
-    FarVector<float> key_cache;    // (layer, seq_len, dim)
-    FarVector<float> value_cache;  // (layer, seq_len, dim)
+    float* key_cache;    // (layer, seq_len, dim)
+    float* value_cache;  // (layer, seq_len, dim)
 } RunState;
 
 typedef struct {
@@ -114,6 +118,18 @@ typedef struct {
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    const size_t x_mem_size = p->dim * sizeof(float);
+    const size_t xb_mem_size = x_mem_size;
+    const size_t xb2_mem_size = xb_mem_size;
+    const size_t hb_mem_size = p->hidden_dim * sizeof(float);
+    const size_t hb2_mem_size = hb_mem_size;
+    const size_t q_mem_size = p->dim * sizeof(float);
+    const size_t key_cache_size = p->n_layers * p->seq_len * kv_dim *
+                                  sizeof(float);  // 1G for llama-7b-chat
+    const size_t value_cache_size = p->n_layers * p->seq_len * kv_dim *
+                                    sizeof(float);  // 1G for llama-7b-chat
+    const size_t att_mem_size = p->n_heads * p->seq_len * sizeof(float);
+    const size_t logits_mem_size = p->vocab_size * sizeof(float);
     s->x = static_cast<float*>(
         calloc(p->dim, sizeof(float)));  // 16K for llama-7b-chat
     s->xb = static_cast<float*>(
@@ -126,23 +142,42 @@ void malloc_run_state(RunState* s, Config* p) {
         calloc(p->hidden_dim, sizeof(float)));  // 43K for llama-7b-chat
     s->q = static_cast<float*>(
         calloc(p->dim, sizeof(float)));  // 16K for llama-7b-chat
-    const size_t key_cache_size =
-        p->n_layers * p->seq_len * kv_dim;  // 1G for llama-7b-chat
-    const size_t value_cache_size =
-        p->n_layers * p->seq_len * kv_dim;  // 1G for llama-7b-chat
-    s->key_cache.resize(key_cache_size);
-    s->value_cache.resize(value_cache_size);
+    s->key_cache = static_cast<float*>(
+        calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+    s->value_cache = static_cast<float*>(
+        calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
     s->att = static_cast<float*>(calloc(
         p->n_heads * p->seq_len, sizeof(float)));  // 256K for llama-7b-chat
     s->logits = static_cast<float*>(
         calloc(p->vocab_size, sizeof(float)));  // 125K for llama-7b-chat
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
-        s->key_cache.size() != key_cache_size ||
-        s->value_cache.size() != value_cache_size || !s->att || !s->logits) {
+        !s->key_cache || !s->value_cache || !s->att || !s->logits) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
+    std::cout << "x size: " << static_cast<double>(x_mem_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "xb size: " << static_cast<double>(xb_mem_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "xb2 size: " << static_cast<double>(xb2_mem_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "hb size: " << static_cast<double>(hb_mem_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "hb2 size: " << static_cast<double>(hb2_mem_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "q size: " << static_cast<double>(q_mem_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "key cache size: "
+              << static_cast<double>(key_cache_size * sizeof(float)) / 1024
+              << "K" << std::endl;
+    std::cout << "value cache size: "
+              << static_cast<double>(value_cache_size * sizeof(float)) / 1024
+              << "K" << std::endl;
+    std::cout << "att size: " << static_cast<double>(att_mem_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "logit size: " << static_cast<double>(logits_mem_size) / 1024
+              << "K" << std::endl;
 }
 
 void free_run_state(RunState* s) {
@@ -154,8 +189,8 @@ void free_run_state(RunState* s) {
     free(s->q);
     free(s->att);
     free(s->logits);
-    s->key_cache.clear();
-    s->value_cache.clear();
+    free(s->key_cache);
+    free(s->value_cache);
 }
 
 void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
@@ -215,6 +250,43 @@ void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
     ptr += rms_final_weight_size;
     w->wcls.assign_all(shared_weights ? token_embedding_table_ptr : ptr,
                        wcls_size);
+    std::cout << "token_embedding_table_size: "
+              << static_cast<double>(token_embedding_table_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "rms_att_weight_size: "
+              << static_cast<double>(rms_att_weight_size) / 1024 << "K"
+              << std::endl;
+    std::cout << "wq_size: "
+              << static_cast<double>(wq_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
+    std::cout << "wk_size: "
+              << static_cast<double>(wk_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
+    std::cout << "wv_size: "
+              << static_cast<double>(wv_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
+    std::cout << "wo_size: "
+              << static_cast<double>(wo_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
+    std::cout << "rms_ffn_weight_size: "
+              << static_cast<double>(rms_ffn_weight_size * sizeof(float)) / 1024
+              << "K" << std::endl;
+    std::cout << "w1_size: "
+              << static_cast<double>(w1_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
+    std::cout << "w2_size: "
+              << static_cast<double>(w2_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
+    std::cout << "w3_size: "
+              << static_cast<double>(w3_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
+    std::cout << "rms_final_weight_size: "
+              << static_cast<double>(rms_final_weight_size * sizeof(float)) /
+                     1024
+              << "K" << std::endl;
+    std::cout << "wcls_size: "
+              << static_cast<double>(wcls_size * sizeof(float)) / 1024 << "K"
+              << std::endl;
 }
 
 void read_checkpoint(const char* checkpoint, Config* config,
@@ -249,8 +321,15 @@ void read_checkpoint(const char* checkpoint, Config* config,
         fprintf(stderr, "mmap failed!\n");
         exit(EXIT_FAILURE);
     }
-    float* weights_ptr = *data + sizeof(Config) / sizeof(float);
+    float* ptr = (float*)(malloc(*file_size));
+    memmove(ptr, *data, *file_size);
+    float* weights_ptr = ptr + sizeof(Config) / sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
+    if (munmap(*data, *file_size)) {
+        fprintf(stderr, "mmap failed!\n");
+        exit(EXIT_FAILURE);
+    }
+    *data = static_cast<float*>(MAP_FAILED);  // avoid double unmap
 }
 
 void build_transformer(Transformer* t, const char* checkpoint_path) {
@@ -354,19 +433,20 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-#pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
+// void matmul(float* xout, float* x, float* w, int n, int d) {
+//     // W (d,n) @ x (n,) -> xout (d,)
+//     // by far the most amount of time is spent inside this little function
+//     int i;
+//     abort();
+// #pragma omp parallel for private(i)
+//     for (i = 0; i < d; i++) {
+//         float val = 0.0f;
+//         for (int j = 0; j < n; j++) {
+//             val += w[i * n + j] * x[j];
+//         }
+//         xout[i] = val;
+//     }
+// }
 
 void matmul(float* xout, float* x, FarVector<float>& weight_fv, size_t wstart,
             int n, int d) {
@@ -484,11 +564,11 @@ float* forward(Transformer* transformer, int token, int pos) {
         // qkv matmuls for this position
         const size_t key_cache_start = loff + pos * kv_dim;
         const size_t value_cache_start = loff + pos * kv_dim;
+        s->k = s->key_cache + loff + pos * kv_dim;
+        s->v = s->value_cache + loff + pos * kv_dim;
         matmul(s->q, s->xb, w->wq, l * dim * dim, dim, dim);
-        matmul(s->key_cache, loff + pos * kv_dim, s->xb, w->wk,
-               l * dim * kv_dim, dim, kv_dim);
-        matmul(s->value_cache, loff + pos * kv_dim, s->xb, w->wv,
-               l * dim * kv_dim, dim, kv_dim);
+        matmul(s->k, s->xb, w->wk, l * dim * kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv, l * dim * kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in
         // each head
@@ -496,59 +576,28 @@ float* forward(Transformer* transformer, int token, int pos) {
             const int min_dim = std::min(dim, kv_dim);
             const size_t thread_cnt = get_thread_count();
             const size_t block = (min_dim / 2 + thread_cnt - 1) / thread_cnt;
-            uthread::parallel_for_with_scope<1>(
-                thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
-                    const int idx_start = i * block * 2;
-                    const int idx_end = std::min(
-                        min_dim, static_cast<int>(idx_start + block * 2));
-                    if (idx_start >= idx_end) {
-                        return;
-                    }
-                    using it_t = decltype(s->key_cache.lbegin());
-                    struct Scope : public DereferenceScope {
-                        it_t it;
-                        it_t it1;
+            uthread::parallel_for<1>(thread_cnt, thread_cnt, [&](size_t i) {
+                const int idx_start = i * block * 2;
+                const int idx_end =
+                    std::min(min_dim, static_cast<int>(idx_start + block * 2));
+                if (idx_start >= idx_end) {
+                    return;
+                }
+                for (int i = idx_start; i < idx_end; i += 2) {
+                    int head_dim = i % head_size;
+                    float freq =
+                        1.0f / powf(10000.0f, head_dim / (float)head_size);
+                    float val = pos * freq;
+                    float fcr = cosf(val);
+                    float fci = sinf(val);
 
-                        void pin() const override {
-                            it.pin();
-                            it1.pin();
-                        }
-
-                        void unpin() const override {
-                            it.unpin();
-                            it1.unpin();
-                        }
-
-                        void next2() {
-                            it.nextn(2, *this);
-                            it1.nextn(2, *this);
-                        }
-
-                        Scope(DereferenceScope* scope)
-                            : DereferenceScope(scope) {}
-                    } scp(&scope);
-                    scp.it = s->key_cache.get_lite_iter(
-                        key_cache_start + idx_start, scp,
-                        key_cache_start + idx_start, key_cache_start + idx_end);
-                    scp.it1 = s->key_cache.get_lite_iter(
-                        key_cache_start + idx_start + 1, scp,
-                        key_cache_start + idx_start, key_cache_start + idx_end);
-                    for (int i = idx_start; i < idx_end; i += 2, scp.next2()) {
-                        int head_dim = i % head_size;
-                        float freq =
-                            1.0f / powf(10000.0f, head_dim / (float)head_size);
-                        float val = pos * freq;
-                        float fcr = cosf(val);
-                        float fci = sinf(val);
-
-                        int rotn =
-                            2;  // how many vectors? 2 = q & k, 1 = q only
-                        float v0 = *(scp.it);
-                        float v1 = *(scp.it1);
-                        *(scp.it) = v0 * fcr - v1 * fci;
-                        *(scp.it1) = v0 * fci + v1 * fcr;
-                    }
-                });
+                    float* vec = s->k;
+                    float v0 = vec[i];
+                    float v1 = vec[i + 1];
+                    vec[i] = v0 * fcr - v1 * fci;
+                    vec[i + 1] = v0 * fci + v1 * fcr;
+                }
+            });
         }
 
         for (int i = 0; i < dim; i += 2) {
@@ -569,73 +618,54 @@ float* forward(Transformer* transformer, int token, int pos) {
         // multihead attention. iterate over all heads
         const size_t thread_cnt = get_thread_count();
         const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
-        uthread::parallel_for_with_scope<1>(
-            thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
-                const size_t h_start = i * block;
-                const size_t h_end =
-                    std::min(h_start + block, static_cast<size_t>(p->n_heads));
-                if (h_start >= h_end) {
-                    return;
-                }
-                for (size_t h = h_start; h < h_end; h++) {
-                    // get the query vector for this head
-                    float* q = s->q + h * head_size;
-                    // attention scores for this head
-                    float* att = s->att + h * p->seq_len;
-                    // iterate over all timesteps, including the current one
-                    using it_t = decltype(s->key_cache.clbegin());
-                    struct Scope : public DereferenceScope {
-                        it_t it;
-
-                        void pin() const override { it.pin(); }
-
-                        void unpin() const override { it.unpin(); }
-
-                        Scope(DereferenceScope* scope)
-                            : DereferenceScope(scope) {}
-                    } scp(&scope);
-                    for (int t = 0; t <= pos; t++) {
-                        // get the key vector for this head and at this timestep
-                        const size_t key_cache_base =
-                            loff + t * kv_dim + (h / kv_mul) * head_size;
-                        scp.it = s->key_cache.get_const_lite_iter(
-                            key_cache_base, scp, key_cache_base,
-                            key_cache_base + head_size);
-                        // calculate the attention score as the dot
-                        // product of q and k
-                        float score = 0.0f;
-                        for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
-                            score += q[i] * (*(scp.it));
-                        }
-                        score /= sqrtf(head_size);
-                        // save the score to the attention buffer
-                        att[t] = score;
+        uthread::parallel_for<1>(thread_cnt, thread_cnt, [&](size_t i) {
+            const size_t h_start = i * block;
+            const size_t h_end =
+                std::min(h_start + block, static_cast<size_t>(p->n_heads));
+            if (h_start >= h_end) {
+                return;
+            }
+            for (size_t h = h_start; h < h_end; h++) {
+                // get the query vector for this head
+                float* q = s->q + h * head_size;
+                // attention scores for this head
+                float* att = s->att + h * p->seq_len;
+                // iterate over all timesteps, including the current one
+                for (int t = 0; t <= pos; t++) {
+                    // get the key vector for this head and at this timestep
+                    float* k = s->key_cache + loff + t * kv_dim +
+                               (h / kv_mul) * head_size;
+                    // calculate the attention score as the dot
+                    // product of q and k
+                    float score = 0.0f;
+                    for (int i = 0; i < head_size; i++) {
+                        score += q[i] * k[i];
                     }
+                    score /= sqrtf(head_size);
+                    // save the score to the attention buffer
+                    att[t] = score;
+                }
+                // softmax the scores to get attention weights, from 0..pos
+                // inclusively
+                softmax(att, pos + 1);
 
-                    // softmax the scores to get attention weights, from 0..pos
-                    // inclusively
-                    softmax(att, pos + 1);
-
-                    // weighted sum of the values, store back into xb
-                    float* xb = s->xb + h * head_size;
-                    memset(xb, 0, head_size * sizeof(float));
-                    for (int t = 0; t <= pos; t++) {
-                        // get the value vector for this head and at this
-                        // timestep
-                        const size_t value_cache_base =
-                            loff + t * kv_dim + (h / kv_mul) * head_size;
-                        scp.it = s->value_cache.get_const_lite_iter(
-                            value_cache_base, scp, value_cache_base,
-                            value_cache_base + head_size);
-                        // get the attention weight for this timestep
-                        float a = att[t];
-                        // accumulate the weighted value into xb
-                        for (int i = 0; i < head_size; i++, scp.it.next(scp)) {
-                            xb[i] += a * (*(scp.it));
-                        }
+                // weighted sum of the values, store back into xb
+                float* xb = s->xb + h * head_size;
+                memset(xb, 0, head_size * sizeof(float));
+                for (int t = 0; t <= pos; t++) {
+                    // get the value vector for this head and at this
+                    // timestep
+                    float* v = s->value_cache + loff + t * kv_dim +
+                               (h / kv_mul) * head_size;
+                    // get the attention weight for this timestep
+                    float a = att[t];
+                    // accumulate the weighted value into xb
+                    for (int i = 0; i < head_size; i++) {
+                        xb[i] += a * v[i];
                     }
                 }
-            });
+            }
+        });
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo, l * dim * dim, dim, dim);
@@ -705,11 +735,12 @@ void build_tokenizer(Tokenizer* t, const char* tokenizer_path, int vocab_size) {
     // i should have written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
     // malloc space to hold the scores and the strings
-    t->vocab =
-        (char**)malloc(vocab_size * sizeof(char*));  // 31K for llama-7b-chat
+    const size_t vocab_mem_size = vocab_size * sizeof(char*);
+    const size_t vocab_scores_mem_size = vocab_size * sizeof(float);
+    t->vocab = (char**)malloc(vocab_mem_size);  // 31K for llama-7b-chat
     t->vocab_scores =
-        (float*)malloc(vocab_size * sizeof(float));  // 125K for llama-7b-chat
-    t->sorted_vocab = NULL;                          // initialized lazily
+        (float*)malloc(vocab_scores_mem_size);  // 125K for llama-7b-chat
+    t->sorted_vocab = NULL;                     // initialized lazily
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
         t->byte_pieces[i * 2 + 1] = '\0';
@@ -806,9 +837,12 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
         fprintf(stderr, "cannot encode NULL text\n");
         exit(EXIT_FAILURE);
     }
+    const size_t str_buffer_mem_size =
+        (t->max_token_length * 2 + 1 + 2) * sizeof(char);
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
+        const size_t sorted_vocab_mem_size = t->vocab_size * sizeof(TokenIndex);
         t->sorted_vocab = static_cast<TokenIndex*>(malloc(
             t->vocab_size * sizeof(TokenIndex)));  // 500K for llama-7b-chat
         for (int i = 0; i < t->vocab_size; i++) {
@@ -1037,8 +1071,9 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature,
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = static_cast<ProbIndex*>(malloc(
-        sampler->vocab_size * sizeof(ProbIndex)));  // 125K for llama-7b-chat
+    const size_t probindex_mem_size = sampler->vocab_size * sizeof(ProbIndex);
+    sampler->probindex = static_cast<ProbIndex*>(
+        malloc(probindex_mem_size));  // 125K for llama-7b-chat
 }
 
 void free_sampler(Sampler* sampler) { free(sampler->probindex); }
@@ -1184,15 +1219,23 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
 
+#define SYSTEM_PROMPT_SIZE (512)
+#define USER_PROMPT_SIZE (512)
+#define RENDERED_PROMPT_SIZE (1152)
+#define SYSTEM_PROMPT_MEM_SIZE (SYSTEM_PROMPT_SIZE * sizeof(char))
+#define USER_PROMPT_MEM_SIZE (USER_PROMPT_SIZE * sizeof(char))
+#define RENDERED_PROMPT_MEM_SIZE (RENDERED_PROMPT_SIZE * sizeof(char))
+#define PROMPT_TOKENS_SIZE (1152)
+#define PROMPT_TOKENS_MEM_SIZE (PROMPT_TOKENS_SIZE * sizeof(int))
 void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
           char* cli_user_prompt, char* cli_system_prompt, int steps) {
     // buffers for reading the system prompt and user prompt from stdin
     // you'll notice they are soomewhat haphazardly and unsafely set atm
-    char system_prompt[512];
-    char user_prompt[512];
-    char rendered_prompt[1152];
+    char system_prompt[SYSTEM_PROMPT_SIZE];
+    char user_prompt[USER_PROMPT_SIZE];
+    char rendered_prompt[RENDERED_PROMPT_SIZE];
     int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
+    int* prompt_tokens = (int*)malloc(PROMPT_TOKENS_MEM_SIZE);
     int user_idx;
 
     // start the main loop
@@ -1326,6 +1369,15 @@ void error_usage() {
 
 int main(int argc, char* argv[]) {
     Configure config;
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    for (int c = 24; c < 24 + 16; c++) {
+        CPU_SET(c, &mask);
+    }
+    if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {
+        perror("sched failed!\n");
+        exit(EXIT_FAILURE);
+    }
 #ifdef STANDALONE
     constexpr size_t FAR_ARGC = 0;
     config.server_addr = "127.0.0.1";

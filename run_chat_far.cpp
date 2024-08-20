@@ -1348,7 +1348,12 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
 // CLI, include only if not testing
 #ifndef TESTING
 
-void error_usage() {
+void error_usage(int argc, char* argv[]) {
+    fprintf(stderr, "Your args: \n");
+    for (int i = 0; i < argc; i++) {
+        fprintf(stderr, "%s ", argv[i]);
+    }
+    fprintf(stderr, "\n");
     fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
@@ -1412,18 +1417,18 @@ int main(int argc, char* argv[]) {
     if (argc >= 2 + FAR_ARGC) {
         checkpoint_path = argv[1 + FAR_ARGC];
     } else {
-        error_usage();
+        error_usage(argc, argv);
     }
     for (int i = 2 + FAR_ARGC; i < argc; i += 2) {
         // do some basic validation
         if (i + 1 >= argc) {
-            error_usage();
+            error_usage(argc, argv);
         }  // must have arg after flag
         if (argv[i][0] != '-') {
-            error_usage();
+            error_usage(argc, argv);
         }  // must start with dash
         if (strlen(argv[i]) != 2) {
-            error_usage();
+            error_usage(argc, argv);
         }  // must be -x (one dash, one letter)
         // read in the args
         if (argv[i][1] == 't') {
@@ -1445,7 +1450,7 @@ int main(int argc, char* argv[]) {
         } else if (argv[i][1] == 'b') {
             config.client_buffer_size = std::stoul(argv[i + 1]);
         } else {
-            error_usage();
+            error_usage(argc, argv);
         }
     }
 
@@ -1486,7 +1491,7 @@ int main(int argc, char* argv[]) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
-        error_usage();
+        error_usage(argc, argv);
     }
     auto end = get_cycles();
     std::cout << "wall time: " << static_cast<double>(end - start) / 2.8 / 1e3

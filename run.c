@@ -95,6 +95,12 @@ typedef struct {
     ssize_t file_size;  // size of the checkpoint file in bytes
 } Transformer;
 
+void mlock_check(const void* buf, size_t len) {
+    int err;
+    if (err = mlock(buf, len)) {
+        printf("mlock error!error code = %d\n", err);
+    }
+}
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -136,16 +142,16 @@ void malloc_run_state(RunState* s, Config* p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
-    mlock(s->x, x_mem_size);
-    mlock(s->xb, xb_mem_size);
-    mlock(s->xb2, xb2_mem_size);
-    mlock(s->hb, hb_mem_size);
-    mlock(s->hb2, hb2_mem_size);
-    mlock(s->q, q_mem_size);
-    mlock(s->att, att_mem_size);
-    mlock(s->logits, logits_mem_size);
-    mlock(s->key_cache, key_cache_mem_size);
-    mlock(s->value_cache, value_cache_mem_size);
+    mlock_check(s->x, x_mem_size);
+    mlock_check(s->xb, xb_mem_size);
+    mlock_check(s->xb2, xb2_mem_size);
+    mlock_check(s->hb, hb_mem_size);
+    mlock_check(s->hb2, hb2_mem_size);
+    mlock_check(s->q, q_mem_size);
+    mlock_check(s->att, att_mem_size);
+    mlock_check(s->logits, logits_mem_size);
+    mlock_check(s->key_cache, key_cache_mem_size);
+    mlock_check(s->value_cache, value_cache_mem_size);
 }
 
 void free_run_state(RunState* s) {
@@ -553,8 +559,8 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     t->vocab_scores = (float*)aligned_alloc(PAGE_ALIGN, vocab_scores_mem_size);
     // printf("vocab size: %zu\n", vocab_mem_size);
     // printf("vocab_scores size: %zu\n", vocab_scores_mem_size);
-    mlock(t->vocab, vocab_mem_size);
-    mlock(t->vocab_scores, vocab_scores_mem_size);
+    mlock_check(t->vocab, vocab_mem_size);
+    mlock_check(t->vocab_scores, vocab_scores_mem_size);
     t->sorted_vocab = NULL;  // initialized lazily
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
@@ -581,7 +587,7 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
             exit(EXIT_FAILURE);
         }
         t->vocab[i] = (char*)malloc(len + 1);
-        mlock(t->vocab[i], len + 1);
+        mlock_check(t->vocab[i], len + 1);
         if (fread(t->vocab[i], len, 1, file) != 1) {
             fprintf(stderr, "failed read\n");
             exit(EXIT_FAILURE);
@@ -661,7 +667,7 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
         const size_t sorted_vocab_mem_size = t->vocab_size * sizeof(TokenIndex);
         t->sorted_vocab = aligned_alloc(PAGE_ALIGN, sorted_vocab_mem_size);
         // printf("sorted_vocab size: %zu\n", sorted_vocab_mem_size);
-        mlock(t->sorted_vocab, sorted_vocab_mem_size);
+        mlock_check(t->sorted_vocab, sorted_vocab_mem_size);
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
@@ -893,7 +899,7 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature,
     const size_t probindex_mem_size = sampler->vocab_size * sizeof(ProbIndex);
     // printf("probindex_mem_size: %zu\n", probindex_mem_size);
     sampler->probindex = aligned_alloc(PAGE_ALIGN, probindex_mem_size);
-    mlock(sampler->probindex, probindex_mem_size);
+    mlock_check(sampler->probindex, probindex_mem_size);
 }
 
 void free_sampler(Sampler* sampler) {
@@ -1057,11 +1063,11 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     printf("RENDERED_PROMPT_MEM_SIZE: %ld\n", RENDERED_PROMPT_MEM_SIZE);
     printf("PROMPT_TOKENS_MEM_SIZE: %ld\n", PROMPT_TOKENS_MEM_SIZE);
     fflush(stdout);
-    mlock(system_prompt, SYSTEM_PROMPT_MEM_SIZE);
-    mlock(user_prompt, USER_PROMPT_MEM_SIZE);
-    mlock(rendered_prompt, RENDERED_PROMPT_MEM_SIZE);
-    mlock(prompt_tokens, PROMPT_TOKENS_MEM_SIZE);
-    printf("mlock end, start loop\n");
+    mlock_check(system_prompt, SYSTEM_PROMPT_MEM_SIZE);
+    mlock_check(user_prompt, USER_PROMPT_MEM_SIZE);
+    mlock_check(rendered_prompt, RENDERED_PROMPT_MEM_SIZE);
+    mlock_check(prompt_tokens, PROMPT_TOKENS_MEM_SIZE);
+    printf("mlock_check end, start loop\n");
     // start the main loop
     int8_t user_turn = 1;  // user starts
     int next;              // will store the next token in the sequence
@@ -1272,7 +1278,7 @@ int main(int argc, char* argv[]) {
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
-    mlock(&transformer, sizeof(transformer));
+    mlock_check(&transformer, sizeof(transformer));
     printf("transformer size: %zu\n", sizeof(transformer));
     fflush(stdout);
     if (steps == 0 || steps > transformer.config.seq_len)
@@ -1283,14 +1289,14 @@ int main(int argc, char* argv[]) {
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
     printf("tokenizer size: %zu\n", sizeof(tokenizer));
     fflush(stdout);
-    mlock(&tokenizer, sizeof(tokenizer));
+    mlock_check(&tokenizer, sizeof(tokenizer));
     // build the Sampler
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
                   rng_seed);
     printf("sampler size: %zu\n", sizeof(sampler));
     fflush(stdout);
-    mlock(&sampler, sizeof(sampler));
+    mlock_check(&sampler, sizeof(sampler));
     // run!
     reset_swap_stats();
     long chat_start = time_in_ms();

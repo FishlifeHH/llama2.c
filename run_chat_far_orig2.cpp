@@ -37,7 +37,7 @@ constexpr uint64_t kCacheGBs = 72;
 constexpr uint64_t kCacheSize = kCacheGBs << 30;
 constexpr uint64_t kFarMemSize = (32ULL << 30); // 1 GB. Not relevant here.
 constexpr uint64_t kNumGCThreads = 16;
-constexpr uint64_t kNumElementsPerScope = 1024;
+constexpr uint64_t kNumElementsPerScope = 128;
 constexpr uint64_t kNumConnections = 400;
 
 typedef struct {

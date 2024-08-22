@@ -37,7 +37,7 @@ constexpr uint64_t kCacheGBs = 3;
 constexpr uint64_t kCacheSize = kCacheGBs << 30;
 constexpr uint64_t kFarMemSize = (32ULL << 30); // 1 GB. Not relevant here.
 constexpr uint64_t kNumGCThreads = 40;
-constexpr uint64_t kNumElementsPerScope = 1024;
+constexpr uint64_t kNumElementsPerScope = 128;
 constexpr uint64_t kNumConnections = 400;
 
 typedef struct {
@@ -165,13 +165,6 @@ static inline size_t get_thread_count() {
 
 // ----------------------------------------------------------------------------
 // utilities: time
-
-long time_in_ms() {
-  // return time in milliseconds, for benchmarking the model speed
-  struct timespec time;
-  clock_gettime(CLOCK_REALTIME, &time);
-  return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
 
 struct Transformer {
   Config config; // the hyperparameters of the architecture (the blueprint)
@@ -378,6 +371,7 @@ void rmsnorm(float *o, float *x, float *weight, int size) {
     const size_t block = (size + thread_cnt - 1) / thread_cnt;
     for (int id = 0; id < thread_cnt; id++) {
       threads.emplace_back([&, id] {
+        stats::AppThreadTimer timer;
         const size_t jstart = id * block;
         const size_t jend = std::min(jstart + block, static_cast<size_t>(size));
         for (int j = jstart; j < jend; j++) {
@@ -411,6 +405,7 @@ void rmsnorm(float *o, float *x, DataFrameVector<float> &weight_fv,
   std::vector<rt::Thread> threads;
   for (int tid = 0; tid < thread_cnt; tid++) {
     threads.emplace_back([&, tid] {
+      stats::AppThreadTimer timer;
       const size_t o_start = tid * block;
       const size_t o_end = std::min(o_start + block, static_cast<size_t>(size));
       const size_t idx_start = o_start + start;
@@ -485,6 +480,7 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
   threads.reserve(thread_cnt);
   for (int tid = 0; tid < thread_cnt; tid++) {
     threads.emplace_back([&, tid] {
+      stats::AppThreadTimer timer;
       auto tstart = time_in_ms();
       const size_t d_start = tid * block;
       const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
@@ -516,68 +512,12 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
     t.Join();
   }
   size_t mend = time_in_ms();
-  helpers::safe_printf("thread time min = %lu ms\n",
-                       *std::min_element(th_times.begin(), th_times.end()));
-  helpers::safe_printf("thread time max = %lu ms\n",
-                       *std::max_element(th_times.begin(), th_times.end()));
-  helpers::safe_printf("m time: %ld ms\n", mend - mstart);
+  // helpers::safe_printf("thread time min = %lu ms\n",
+  //                      *std::min_element(th_times.begin(), th_times.end()));
+  // helpers::safe_printf("thread time max = %lu ms\n",
+  //                      *std::max_element(th_times.begin(), th_times.end()));
+  // helpers::safe_printf("m time: %ld ms\n", mend - mstart);
 }
-
-// void matmul(DataFrameVector<float> &xout_fv, size_t xout_start, float *x,
-//             DataFrameVector<float> &weight_fv, size_t wstart, int n, int d,
-//             const char *name = "") {
-//   // W (d,n) @ x (n,) -> xout (d,)
-//   // by far the most amount of time is spent inside this little function
-//   // helpers::safe_printf("%s matmul n = %d, d = %d\n", name, n, d);
-//   const size_t thread_cnt = get_thread_count();
-//   const size_t block = (d + thread_cnt - 1) / thread_cnt;
-//   size_t mstart = time_in_ms();
-//   std::vector<rt::Thread> threads;
-//   std::vector<size_t> th_times(thread_cnt);
-//   threads.reserve(thread_cnt);
-//   for (int tid = 0; tid < thread_cnt; tid++) {
-//     threads.emplace_back([&, tid] {
-//       auto tstart = time_in_ms();
-//       const size_t d_start = tid * block;
-//       const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
-//       const size_t out_start = xout_start + d_start;
-//       const size_t out_end = xout_start + d_end;
-//       if (d_start >= d_end) {
-//         return;
-//       }
-//       DerefScope scope;
-//       auto out_it = xout_fv.fpbegin(scope, tid) + out_start;
-//       for (size_t dd = d_start; dd < d_end; dd++, ++out_it) {
-//         float val = 0.0f;
-//         const size_t idx_start = wstart + dd * n;
-//         const size_t idx_end = wstart + (dd + 1) * n;
-//         auto w_it = weight_fv.cfpbegin(scope, tid) + idx_start;
-//         for (size_t j = 0; j < n; j++, ++w_it) {
-//           if (unlikely(((dd - d_start) * n + j) %
-//                            weight_fv.kNumElementsPerScope ==
-//                        0)) {
-//             scope.renew();
-//             out_it.renew(scope);
-//             w_it.renew(scope);
-//           }
-//           val += *w_it * x[j];
-//         }
-//         *out_it = val;
-//       }
-//       auto tend = time_in_ms();
-//       th_times[tid] = tend - tstart;
-//     });
-//   }
-//   for (auto &t : threads) {
-//     t.Join();
-//   }
-//   size_t mend = time_in_ms();
-//   helpers::safe_printf("thread time min = %lu ms\n",
-//                        *std::min_element(th_times.begin(), th_times.end()));
-//   helpers::safe_printf("thread time max = %lu ms\n",
-//                        *std::max_element(th_times.begin(), th_times.end()));
-//   helpers::safe_printf("m2 time: %ld ms\n", mend - mstart);
-// }
 
 float *forward(Transformer *transformer, int token, int pos) {
   // a few convenience variables
@@ -623,6 +563,7 @@ float *forward(Transformer *transformer, int token, int pos) {
       std::vector<rt::Thread> threads;
       for (int tid = 0; tid < thread_cnt; tid++) {
         threads.emplace_back([&, tid] {
+          stats::AppThreadTimer timer;
           const int idx_start = tid * block * 2;
           const int idx_end =
               std::min(min_dim, static_cast<int>(idx_start + block * 2));
@@ -671,13 +612,13 @@ float *forward(Transformer *transformer, int token, int pos) {
     std::vector<rt::Thread> threads;
     for (int tid = 0; tid < thread_cnt; tid++) {
       threads.emplace_back([&, tid] {
+        stats::AppThreadTimer timer;
         const size_t h_start = tid * block;
         const size_t h_end =
             std::min(h_start + block, static_cast<size_t>(p->n_heads));
         if (h_start >= h_end) {
           return;
         }
-        DerefScope scope;
         for (size_t h = h_start; h < h_end; h++) {
           // get the query vector for this head
           float *q = s->q + h * head_size;
@@ -1266,6 +1207,7 @@ void read_stdin(const char *guide, char *buffer, size_t bufsize) {
 
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps) {
+  stats::AppThreadTimer timer;
   // buffers for reading the system prompt and user prompt from stdin
   // you'll notice they are soomewhat haphazardly and unsafely set atm
   char system_prompt[512];
@@ -1510,19 +1452,30 @@ void _main(void *arg) {
   auto bw_before = Stats::get_tcp_rw_bytes();
   auto rw_before = Stats::get_tcp_rbytes();
   auto ww_before = Stats::get_tcp_wbytes();
+  auto local_acc_before = Stats::get_local_access_cnt();
+  auto remote_acc_before = Stats::get_remote_access_cnt();
+  auto prefetch_local_acc_before = Stats::get_prefetch_local_access_cnt();
+  auto prefetch_remote_acc_before = Stats::get_prefetch_remote_access_cnt();
+  auto app_us_before = Stats::get_app_us();
+  auto prefetch_us_before = Stats::get_prefetch_us();
+  auto gc_mark_before = Stats::get_gc_mark_us();
+  auto gc_writeback_before = Stats::get_gc_writeback_us();
+  auto gc_wb_dirty_before = Stats::get_gc_wb_dirty_cnt();
+  auto gc_wb_clean_before = Stats::get_gc_wb_clean_cnt();
+  auto gc_wb_hot_before = Stats::get_gc_wb_hot_cnt();
+  auto gc_wb_lock_object_before = Stats::get_gc_wb_lock_object_time();
+  auto gc_wb_hot_us_before = Stats::get_gc_wb_hot_us();
   // run!
   FarLib::perf_init();
   auto start = std::chrono::high_resolution_clock::now();
-  FarLib::perf_profile([&] {
-    if (strcmp(mode, "generate") == 0) {
-      generate(&transformer, &tokenizer, &sampler, prompt, steps);
-    } else if (strcmp(mode, "chat") == 0) {
-      chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
-    } else {
-      fprintf(stderr, "unknown mode: %s\n", mode);
-      error_usage();
-    }
-  }).print();
+  if (strcmp(mode, "generate") == 0) {
+    generate(&transformer, &tokenizer, &sampler, prompt, steps);
+  } else if (strcmp(mode, "chat") == 0) {
+    chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+  } else {
+    fprintf(stderr, "unknown mode: %s\n", mode);
+    error_usage();
+  }
   auto end = std::chrono::high_resolution_clock::now();
   auto wall_time =
       std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
@@ -1533,13 +1486,40 @@ void _main(void *arg) {
   auto bw_now = Stats::get_tcp_rw_bytes();
   auto rw_now = Stats::get_tcp_rbytes();
   auto ww_now = Stats::get_tcp_wbytes();
+  auto local_acc_now = Stats::get_local_access_cnt();
+  auto remote_acc_now = Stats::get_remote_access_cnt();
+  auto prefetch_local_acc_now = Stats::get_prefetch_local_access_cnt();
+  auto prefetch_remote_acc_now = Stats::get_prefetch_remote_access_cnt();
+  auto app_us_now = Stats::get_app_us();
+  auto prefetch_us_now = Stats::get_prefetch_us();
+  auto gc_mark_now = Stats::get_gc_mark_us();
+  auto gc_writeback_now = Stats::get_gc_writeback_us();
+  auto gc_wb_dirty_now = Stats::get_gc_wb_dirty_cnt();
+  auto gc_wb_clean_now = Stats::get_gc_wb_clean_cnt();
+  auto gc_wb_hot_now = Stats::get_gc_wb_hot_cnt();
+  auto gc_wb_lock_object_now = Stats::get_gc_wb_lock_object_time();
+  auto gc_wb_hot_us_now = Stats::get_gc_wb_hot_us();
 
   auto scheduler_us = scheduler_us_now - scheduler_us_before;
   auto gc_us = gc_us_now - gc_us_before;
   auto bw = bw_now - bw_before;
   auto rw = rw_now - rw_before;
   auto ww = ww_now - ww_before;
-
+  auto local_acc = local_acc_now - local_acc_before;
+  auto remote_acc = remote_acc_now - remote_acc_before;
+  auto prefetch_local_acc = prefetch_local_acc_now - prefetch_local_acc_before;
+  auto prefetch_remote_acc =
+      prefetch_remote_acc_now - prefetch_remote_acc_before;
+  auto app_us = app_us_now - app_us_before;
+  auto prefetch_us = prefetch_us_now - prefetch_us_before;
+  auto gc_mark_us = gc_mark_now - gc_mark_before;
+  auto gc_writeback_us = gc_writeback_now - gc_writeback_before;
+  auto gc_wb_dirty_cnt = gc_wb_dirty_now - gc_wb_dirty_before;
+  auto gc_wb_clean_cnt = gc_wb_clean_now - gc_wb_clean_before;
+  auto gc_wb_hot_cnt = gc_wb_hot_now - gc_wb_hot_before;
+  auto gc_wb_lock_object_us =
+      (gc_wb_lock_object_now - gc_wb_lock_object_before) / 2.8 / 1e3;
+  auto gc_wb_hot_us = gc_wb_hot_us_now - gc_wb_hot_us_before;
   helpers::safe_printf("scheduler: %lu us\n", scheduler_us);
   helpers::safe_printf("bandwidth: %lf Gbps\n", static_cast<double>(bw) /
                                                     (1L << 30) * 8 /
@@ -1552,7 +1532,23 @@ void _main(void *arg) {
                                                           (wall_time / 1000));
 
   helpers::safe_printf("gc: %lu us\n", gc_us);
-
+  helpers::safe_printf("gc mark: %lu us\n", gc_mark_us);
+  helpers::safe_printf("gc writeback: %lu us\n", gc_writeback_us);
+  helpers::safe_printf("gc writeback dirty: %lu\n", gc_wb_dirty_cnt);
+  helpers::safe_printf("gc writeback clean: %lu\n", gc_wb_clean_cnt);
+  helpers::safe_printf("gc writeback hot: %lu\n", gc_wb_hot_cnt);
+  helpers::safe_printf("gc writeback lock object: %f us\n",
+                       gc_wb_lock_object_us);
+  helpers::safe_printf("gc writeback hot: %lu us\n", gc_wb_hot_us);
+  helpers::safe_printf(
+      "local access: %lu, remote access: %lu, prefetch local access: %lu, \
+      prefetch remote access = %lu, local rate = %f, local rate(with prefetch) = %f\n",
+      local_acc, remote_acc, prefetch_local_acc, prefetch_remote_acc,
+      static_cast<double>(local_acc) / (local_acc + remote_acc),
+      static_cast<double>(local_acc) /
+          (local_acc + remote_acc + prefetch_local_acc + prefetch_remote_acc));
+  helpers::safe_printf("app: %lu us\n", app_us);
+  helpers::safe_printf("prefetch: %lu us\n", prefetch_us);
   // memory and file handles cleanup
   free_sampler(&sampler);
   free_tokenizer(&tokenizer);
@@ -1568,14 +1564,14 @@ int main(int argc, char *argv[]) {
   // std::cout << "In Debug Mode" << std::endl;
   // #endif
   cpu_set_t mask;
-  CPU_ZERO(&mask);
-  for (int c = 25; c < 25 + 16; c++) {
-    CPU_SET(c, &mask);
-  }
-  if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {
-    perror("sched failed!\n");
-    exit(EXIT_FAILURE);
-  }
+  // CPU_ZERO(&mask);
+  // for (int c = 24; c < 24 + 16; c++) {
+  //   CPU_SET(c, &mask);
+  // }
+  // if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {
+  //   perror("sched failed!\n");
+  //   exit(EXIT_FAILURE);
+  // }
 
   if (argc < 3) {
     std::cerr << "usage: [cfg_file] [ip_addr:port]" << std::endl;

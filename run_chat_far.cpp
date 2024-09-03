@@ -33,7 +33,7 @@ extern "C" {
 using namespace far_memory;
 using namespace std::chrono_literals;
 
-constexpr uint64_t kCacheGBs = 3;
+constexpr uint64_t kCacheGBs = 13;
 constexpr uint64_t kCacheSize = kCacheGBs << 30;
 constexpr uint64_t kFarMemSize = (32ULL << 30); // 1 GB. Not relevant here.
 constexpr uint64_t kNumGCThreads = 40;
@@ -1447,108 +1447,21 @@ void _main(void *arg) {
   build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
                 rng_seed);
 
-  auto scheduler_us_before = Stats::get_schedule_us();
-  auto gc_us_before = Stats::get_gc_us();
-  auto bw_before = Stats::get_tcp_rw_bytes();
-  auto rw_before = Stats::get_tcp_rbytes();
-  auto ww_before = Stats::get_tcp_wbytes();
-  auto local_acc_before = Stats::get_local_access_cnt();
-  auto remote_acc_before = Stats::get_remote_access_cnt();
-  auto prefetch_local_acc_before = Stats::get_prefetch_local_access_cnt();
-  auto prefetch_remote_acc_before = Stats::get_prefetch_remote_access_cnt();
-  auto app_us_before = Stats::get_app_us();
-  auto prefetch_us_before = Stats::get_prefetch_us();
-  auto gc_mark_before = Stats::get_gc_mark_us();
-  auto gc_writeback_before = Stats::get_gc_writeback_us();
-  auto gc_wb_dirty_before = Stats::get_gc_wb_dirty_cnt();
-  auto gc_wb_clean_before = Stats::get_gc_wb_clean_cnt();
-  auto gc_wb_hot_before = Stats::get_gc_wb_hot_cnt();
-  auto gc_wb_lock_object_before = Stats::get_gc_wb_lock_object_time();
-  auto gc_wb_hot_us_before = Stats::get_gc_wb_hot_us();
   // run!
   FarLib::perf_init();
-  auto start = std::chrono::high_resolution_clock::now();
-  if (strcmp(mode, "generate") == 0) {
-    generate(&transformer, &tokenizer, &sampler, prompt, steps);
-  } else if (strcmp(mode, "chat") == 0) {
-    chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
-  } else {
-    fprintf(stderr, "unknown mode: %s\n", mode);
-    error_usage();
-  }
-  auto end = std::chrono::high_resolution_clock::now();
-  auto wall_time =
-      std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-          .count();
-  helpers::safe_printf("wall time: %ld ms\n", wall_time);
-  auto scheduler_us_now = Stats::get_schedule_us();
-  auto gc_us_now = Stats::get_gc_us();
-  auto bw_now = Stats::get_tcp_rw_bytes();
-  auto rw_now = Stats::get_tcp_rbytes();
-  auto ww_now = Stats::get_tcp_wbytes();
-  auto local_acc_now = Stats::get_local_access_cnt();
-  auto remote_acc_now = Stats::get_remote_access_cnt();
-  auto prefetch_local_acc_now = Stats::get_prefetch_local_access_cnt();
-  auto prefetch_remote_acc_now = Stats::get_prefetch_remote_access_cnt();
-  auto app_us_now = Stats::get_app_us();
-  auto prefetch_us_now = Stats::get_prefetch_us();
-  auto gc_mark_now = Stats::get_gc_mark_us();
-  auto gc_writeback_now = Stats::get_gc_writeback_us();
-  auto gc_wb_dirty_now = Stats::get_gc_wb_dirty_cnt();
-  auto gc_wb_clean_now = Stats::get_gc_wb_clean_cnt();
-  auto gc_wb_hot_now = Stats::get_gc_wb_hot_cnt();
-  auto gc_wb_lock_object_now = Stats::get_gc_wb_lock_object_time();
-  auto gc_wb_hot_us_now = Stats::get_gc_wb_hot_us();
+  FarLib::perf_profile([&] {
+    aifm_profile([&] {
+      if (strcmp(mode, "generate") == 0) {
+        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+      } else if (strcmp(mode, "chat") == 0) {
+        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+      } else {
+        fprintf(stderr, "unknown mode: %s\n", mode);
+        error_usage();
+      }
+    });
+  }).print();
 
-  auto scheduler_us = scheduler_us_now - scheduler_us_before;
-  auto gc_us = gc_us_now - gc_us_before;
-  auto bw = bw_now - bw_before;
-  auto rw = rw_now - rw_before;
-  auto ww = ww_now - ww_before;
-  auto local_acc = local_acc_now - local_acc_before;
-  auto remote_acc = remote_acc_now - remote_acc_before;
-  auto prefetch_local_acc = prefetch_local_acc_now - prefetch_local_acc_before;
-  auto prefetch_remote_acc =
-      prefetch_remote_acc_now - prefetch_remote_acc_before;
-  auto app_us = app_us_now - app_us_before;
-  auto prefetch_us = prefetch_us_now - prefetch_us_before;
-  auto gc_mark_us = gc_mark_now - gc_mark_before;
-  auto gc_writeback_us = gc_writeback_now - gc_writeback_before;
-  auto gc_wb_dirty_cnt = gc_wb_dirty_now - gc_wb_dirty_before;
-  auto gc_wb_clean_cnt = gc_wb_clean_now - gc_wb_clean_before;
-  auto gc_wb_hot_cnt = gc_wb_hot_now - gc_wb_hot_before;
-  auto gc_wb_lock_object_us =
-      (gc_wb_lock_object_now - gc_wb_lock_object_before) / 2.8 / 1e3;
-  auto gc_wb_hot_us = gc_wb_hot_us_now - gc_wb_hot_us_before;
-  helpers::safe_printf("scheduler: %lu us\n", scheduler_us);
-  helpers::safe_printf("bandwidth: %lf Gbps\n", static_cast<double>(bw) /
-                                                    (1L << 30) * 8 /
-                                                    (wall_time / 1000));
-  helpers::safe_printf("read bandwidth: %lf Gbps\n", static_cast<double>(rw) /
-                                                         (1L << 30) * 8 /
-                                                         (wall_time / 1000));
-  helpers::safe_printf("write bandwidth: %lf Gbps\n", static_cast<double>(ww) /
-                                                          (1L << 30) * 8 /
-                                                          (wall_time / 1000));
-
-  helpers::safe_printf("gc: %lu us\n", gc_us);
-  helpers::safe_printf("gc mark: %lu us\n", gc_mark_us);
-  helpers::safe_printf("gc writeback: %lu us\n", gc_writeback_us);
-  helpers::safe_printf("gc writeback dirty: %lu\n", gc_wb_dirty_cnt);
-  helpers::safe_printf("gc writeback clean: %lu\n", gc_wb_clean_cnt);
-  helpers::safe_printf("gc writeback hot: %lu\n", gc_wb_hot_cnt);
-  helpers::safe_printf("gc writeback lock object: %f us\n",
-                       gc_wb_lock_object_us);
-  helpers::safe_printf("gc writeback hot: %lu us\n", gc_wb_hot_us);
-  helpers::safe_printf(
-      "local access: %lu, remote access: %lu, prefetch local access: %lu, \
-      prefetch remote access = %lu, local rate = %f, local rate(with prefetch) = %f\n",
-      local_acc, remote_acc, prefetch_local_acc, prefetch_remote_acc,
-      static_cast<double>(local_acc) / (local_acc + remote_acc),
-      static_cast<double>(local_acc) /
-          (local_acc + remote_acc + prefetch_local_acc + prefetch_remote_acc));
-  helpers::safe_printf("app: %lu us\n", app_us);
-  helpers::safe_printf("prefetch: %lu us\n", prefetch_us);
   // memory and file handles cleanup
   free_sampler(&sampler);
   free_tokenizer(&tokenizer);

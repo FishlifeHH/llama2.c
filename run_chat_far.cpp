@@ -1465,8 +1465,7 @@ int main(int argc, char* argv[]) {
               << "G" << std::endl;
     std::cout << "core count: " << config.max_thread_cnt << std::endl;
     FarLib::runtime_init(config);
-    // perf_init();
-    // perf_profile([&] {
+    FarLib::perf_init();
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
@@ -1483,16 +1482,21 @@ int main(int argc, char* argv[]) {
                   rng_seed);
 
     // run!
-    profile::reset_all();
     auto start = get_cycles();
-    if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
-    } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
-    } else {
-        fprintf(stderr, "unknown mode: %s\n", mode);
-        error_usage(argc, argv);
-    }
+    FarLib::profile::beehive_profile([&] {
+        FarLib::perf_profile([&] {
+            auto start = get_cycles();
+            if (strcmp(mode, "generate") == 0) {
+                generate(&transformer, &tokenizer, &sampler, prompt, steps);
+            } else if (strcmp(mode, "chat") == 0) {
+                chat(&transformer, &tokenizer, &sampler, prompt, system_prompt,
+                     steps);
+            } else {
+                fprintf(stderr, "unknown mode: %s\n", mode);
+                error_usage(argc, argv);
+            }
+        }).print();
+    });
     auto end = get_cycles();
     std::cout << "wall time: " << static_cast<double>(end - start) / 2.8 / 1e3
               << " us" << std::endl;
@@ -1501,7 +1505,6 @@ int main(int argc, char* argv[]) {
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
-    // }).print();
     FarLib::runtime_destroy();
 #ifdef STANDALONE
     server_thread.join();

@@ -1252,7 +1252,7 @@ int main(int argc, char* argv[]) {
     // default parameters
     // cpu_set_t mask;
     // CPU_ZERO(&mask);
-    // for (int c = 24;c < 24 + 16;c++) {
+    // for (int c = 24; c < 24 + 16; c++) {
     //     CPU_SET(c, &mask);
     // }
     // if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {

@@ -393,22 +393,14 @@ void rmsnorm(float* o, float* x, FarVector<float>& weight_fv, size_t start,
             const size_t idx_start = o_start + start;
             const size_t idx_end = o_end + start;
 
-            if (idx_start >= idx_end) {
+            if (idx_start >= idx_end) [[unlikely]] {
                 return;
             }
-            struct Scope : public DereferenceScope {
-                it_t it;
 
-                void pin() const override { it.pin(); }
-
-                void unpin() const override { it.unpin(); }
-
-                Scope(DereferenceScope* scope) : DereferenceScope(scope) {}
-            } scp(&scope);
-            scp.it = weight_fv.get_const_lite_iter(idx_start, scp, idx_start,
-                                                   idx_end);
-            for (size_t oi = o_start; oi < o_end; oi++, scp.it.next(scp)) {
-                o[oi] = *(scp.it) * (ss * x[oi]);
+            auto it = weight_fv.get_const_lite_iter(idx_start, scope, idx_start,
+                                                    idx_end);
+            for (size_t oi = o_start; oi < o_end; oi++, it.next(scope)) {
+                o[oi] = *it * (ss * x[oi]);
             }
         });
 }
@@ -452,7 +444,10 @@ void matmul(float* xout, float* x, FarVector<float>& weight_fv, size_t wstart,
             int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
+    // std::cout << "n * d = " << n << " * " << d << std::endl;
+    // auto start = get_cycles();
     const size_t thread_cnt = get_thread_count();
+    // std::cout << "thread count = " << thread_cnt << std::endl;
     const size_t block = (d + thread_cnt - 1) / thread_cnt;
     uthread::parallel_for_with_scope<1>(
         thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
@@ -464,75 +459,26 @@ void matmul(float* xout, float* x, FarVector<float>& weight_fv, size_t wstart,
             if (d_start >= d_end) {
                 return;
             }
-            using it_t = decltype(weight_fv.clbegin());
-            struct Scope : public DereferenceScope {
-                it_t it;
-
-                void pin() const override { it.pin(); }
-
-                void unpin() const override { it.unpin(); }
-
-                Scope(DereferenceScope* scope) : DereferenceScope(scope) {}
-            } scp(&scope);
-            scp.it = weight_fv.get_const_lite_iter(idx_start, scp, idx_start,
-                                                   idx_end);
+            auto it = weight_fv.get_const_lite_iter(idx_start, scope, idx_start,
+                                                    idx_end);
             for (size_t dd = d_start; dd < d_end; dd++) {
                 float val = 0.0f;
-                for (size_t j = 0; j < n; j++, scp.it.next(scp)) {
-                    val += *(scp.it) * x[j];
+                for (size_t j = 0; j < n; j++, it.next(scope)) {
+                    val += *it * x[j];
                 }
                 xout[dd] = val;
             }
+            // use this when all local
+            // for (size_t dd = d_start, idx = idx_start; dd < d_end;
+            //      dd++, idx += n) {
+            //     xout[dd] = weight_fv.vecmul(x, n, idx, scope);
+            // }
+            // printf("inner avg time: %d\n", time / (d_end - d_start));
         });
-}
-
-void matmul(FarVector<float>& xout_fv, size_t xout_start, float* x,
-            FarVector<float>& weight_fv, size_t wstart, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    const size_t thread_cnt = get_thread_count();
-    const size_t block = (d + thread_cnt - 1) / thread_cnt;
-    uthread::parallel_for_with_scope<1>(
-        thread_cnt, thread_cnt, [&](size_t i, DereferenceScope& scope) {
-            const size_t d_start = i * block;
-            const size_t d_end =
-                std::min(d_start + block, static_cast<size_t>(d));
-            const size_t out_start = xout_start + d_start;
-            const size_t out_end = xout_start + d_end;
-            if (d_start >= d_end) {
-                return;
-            }
-            using w_it_t = decltype(weight_fv.clbegin());
-            using out_it_t = decltype(xout_fv.lbegin());
-            struct Scope : public DereferenceScope {
-                w_it_t w_it;
-                out_it_t out_it;
-                void pin() const override {
-                    w_it.pin();
-                    out_it.pin();
-                }
-
-                void unpin() const override {
-                    w_it.unpin();
-                    out_it.unpin();
-                }
-
-                Scope(DereferenceScope* scope) : DereferenceScope(scope) {}
-            } scp(&scope);
-            scp.out_it =
-                xout_fv.get_lite_iter(out_start, scp, out_start, out_end);
-            for (size_t dd = d_start; dd < d_end; dd++, scp.out_it.next(scp)) {
-                float val = 0.0f;
-                const size_t idx_start = wstart + dd * n;
-                const size_t idx_end = wstart + (dd + 1) * n;
-                scp.w_it = weight_fv.get_const_lite_iter(idx_start, scp,
-                                                         idx_start, idx_end);
-                for (size_t j = 0; j < n; j++, scp.w_it.next(scp)) {
-                    val += *(scp.w_it) * x[j];
-                }
-                *(scp.out_it) = val;
-            }
-        });
+    // auto end = get_cycles();
+    // std::cout << "matmul time: " << static_cast<double>(end - start) / 2.8 /
+    // 1e6
+    //           << std::endl;
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
@@ -707,6 +653,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     // classifier into logits
     matmul(s->logits, x, w->wcls, 0, p->dim,
            p->vocab_size);  // wcls size = p->dim * p->vocab_size = 125M
+    // std::cout << "--------------------- forward end ---------------------"
+    //           << std::endl;
     return s->logits;
 }
 
@@ -1311,21 +1259,21 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
         }
 
         // forward the transformer to get logits for the next token
-        auto fstart = get_cycles();
+        // auto fstart = get_cycles();
         float* logits = forward(transformer, token, pos);
-        auto fend = get_cycles();
+        // auto fend = get_cycles();
         // printf("forward: %lu\n", fend - fstart);
-        auto sstart = get_cycles();
+        // auto sstart = get_cycles();
         next = sample(sampler, logits);
-        auto send = get_cycles();
+        // auto send = get_cycles();
         // printf("sample: %lu\n", send - sstart);
         pos++;
 
         if (user_idx >= num_prompt_tokens && next != 2) {
             // the Assistant is responding, so print its output
-            auto dstart = get_cycles();
+            // auto dstart = get_cycles();
             char* piece = decode(tokenizer, token, next);
-            auto dend = get_cycles();
+            // auto dend = get_cycles();
             // printf("decode: %lu\n", dend - dstart);
             safe_printf(piece);  // same as printf("%s", piece), but skips
                                  // "unsafe" bytes
@@ -1485,7 +1433,6 @@ int main(int argc, char* argv[]) {
     auto start = get_cycles();
     FarLib::profile::beehive_profile([&] {
         FarLib::perf_profile([&] {
-            auto start = get_cycles();
             if (strcmp(mode, "generate") == 0) {
                 generate(&transformer, &tokenizer, &sampler, prompt, steps);
             } else if (strcmp(mode, "chat") == 0) {

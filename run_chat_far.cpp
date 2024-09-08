@@ -33,11 +33,11 @@ extern "C" {
 using namespace far_memory;
 using namespace std::chrono_literals;
 
-constexpr uint64_t kCacheGBs = 13;
+constexpr uint64_t kCacheGBs = 72;
 constexpr uint64_t kCacheSize = kCacheGBs << 30;
 constexpr uint64_t kFarMemSize = (32ULL << 30); // 1 GB. Not relevant here.
 constexpr uint64_t kNumGCThreads = 40;
-constexpr uint64_t kNumElementsPerScope = 128;
+constexpr uint64_t kNumElementsPerScope = 1024;
 constexpr uint64_t kNumConnections = 400;
 
 typedef struct {
@@ -368,10 +368,11 @@ void rmsnorm(float *o, float *x, float *weight, int size) {
   {
     std::vector<rt::Thread> threads;
     const size_t thread_cnt = get_thread_count();
+    threads.reserve(thread_cnt);
     const size_t block = (size + thread_cnt - 1) / thread_cnt;
     for (int id = 0; id < thread_cnt; id++) {
       threads.emplace_back([&, id] {
-        stats::AppThreadTimer timer;
+        // stats::AppThreadTimer timer;
         const size_t jstart = id * block;
         const size_t jend = std::min(jstart + block, static_cast<size_t>(size));
         for (int j = jstart; j < jend; j++) {
@@ -403,9 +404,10 @@ void rmsnorm(float *o, float *x, DataFrameVector<float> &weight_fv,
   const size_t thread_cnt = get_thread_count();
   const size_t block = (size + thread_cnt - 1) / thread_cnt;
   std::vector<rt::Thread> threads;
+  threads.reserve(thread_cnt);
   for (int tid = 0; tid < thread_cnt; tid++) {
     threads.emplace_back([&, tid] {
-      stats::AppThreadTimer timer;
+      // stats::AppThreadTimer timer;
       const size_t o_start = tid * block;
       const size_t o_end = std::min(o_start + block, static_cast<size_t>(size));
       const size_t idx_start = o_start + start;
@@ -452,36 +454,22 @@ void softmax(float *x, int size) {
   }
 }
 
-void matmul(float *xout, float *x, float *w, int n, int d) {
-  // W (d,n) @ x (n,) -> xout (d,)
-  // by far the most amount of time is spent inside this little function
-  helpers::safe_printf("matmul std n = %d, d = %d\n", n, d);
-  int i;
-#pragma omp parallel for private(i)
-  for (i = 0; i < d; i++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      val += w[i * n + j] * x[j];
-    }
-    xout[i] = val;
-  }
-}
-
 void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
             size_t wstart, int n, int d, const char *name = "") {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   // helpers::safe_printf("%s matmul n = %d, d = %d\n", name, n, d);
-  size_t mstart = time_in_ms();
+  // size_t mstart = time_in_ms();
   const size_t thread_cnt = get_thread_count();
   const size_t block = (d + thread_cnt - 1) / thread_cnt;
   std::vector<rt::Thread> threads;
+  threads.reserve(thread_cnt);
   std::vector<size_t> th_times(thread_cnt);
   threads.reserve(thread_cnt);
   for (int tid = 0; tid < thread_cnt; tid++) {
     threads.emplace_back([&, tid] {
-      stats::AppThreadTimer timer;
-      auto tstart = time_in_ms();
+      // stats::AppThreadTimer timer;
+      // auto tstart = time_in_ms();
       const size_t d_start = tid * block;
       const size_t d_end = std::min(d_start + block, static_cast<size_t>(d));
       const size_t idx_start = wstart + d_start * n;
@@ -504,14 +492,19 @@ void matmul(float *xout, float *x, DataFrameVector<float> &weight_fv,
         }
         xout[dd] = val;
       }
-      auto tend = time_in_ms();
-      th_times[tid] = tend - tstart;
+      // use this if all local
+      // for (size_t dd = d_start, idx = idx_start; dd < d_end; dd++, idx += n)
+      // {
+      //   xout[dd] = weight_fv.vecmul(x, n, idx, scope, tid);
+      // }
+      // auto tend = time_in_ms();
+      // th_times[tid] = tend - tstart;
     });
   }
   for (auto &t : threads) {
     t.Join();
   }
-  size_t mend = time_in_ms();
+  // size_t mend = time_in_ms();
   // helpers::safe_printf("thread time min = %lu ms\n",
   //                      *std::min_element(th_times.begin(), th_times.end()));
   // helpers::safe_printf("thread time max = %lu ms\n",
@@ -561,9 +554,10 @@ float *forward(Transformer *transformer, int token, int pos) {
       const size_t thread_cnt = get_thread_count();
       const size_t block = (min_dim / 2 + thread_cnt - 1) / thread_cnt;
       std::vector<rt::Thread> threads;
+      threads.reserve(thread_cnt);
       for (int tid = 0; tid < thread_cnt; tid++) {
         threads.emplace_back([&, tid] {
-          stats::AppThreadTimer timer;
+          // stats::AppThreadTimer timer;
           const int idx_start = tid * block * 2;
           const int idx_end =
               std::min(min_dim, static_cast<int>(idx_start + block * 2));
@@ -608,11 +602,13 @@ float *forward(Transformer *transformer, int token, int pos) {
     size_t htstart = get_cycles();
     // multihead attention. iterate over all heads
     const size_t thread_cnt = get_thread_count();
+    // helpers::safe_printf("n heads: %d\n", p->n_heads);
     const size_t block = (p->n_heads + thread_cnt - 1) / thread_cnt;
     std::vector<rt::Thread> threads;
+    threads.reserve(thread_cnt);
     for (int tid = 0; tid < thread_cnt; tid++) {
       threads.emplace_back([&, tid] {
-        stats::AppThreadTimer timer;
+        // stats::AppThreadTimer timer;
         const size_t h_start = tid * block;
         const size_t h_end =
             std::min(h_start + block, static_cast<size_t>(p->n_heads));
@@ -710,6 +706,8 @@ float *forward(Transformer *transformer, int token, int pos) {
   // classifier into logits
   matmul(s->logits, x, w->wcls, 0, p->dim, p->vocab_size,
          "logits & x"); // wcls size = p->dim * p->vocab_size = 125M
+  // helpers::safe_printf(
+  //     "--------------------- forward end ---------------------\n");
   return s->logits;
 }
 
@@ -1207,7 +1205,7 @@ void read_stdin(const char *guide, char *buffer, size_t bufsize) {
 
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps) {
-  stats::AppThreadTimer timer;
+  // stats::AppThreadTimer timer;
   // buffers for reading the system prompt and user prompt from stdin
   // you'll notice they are soomewhat haphazardly and unsafely set atm
   char system_prompt[512];

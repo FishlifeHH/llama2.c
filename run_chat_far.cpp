@@ -37,9 +37,9 @@ using namespace FarLib;
 using namespace FarLib::rdma;
 using namespace std::chrono_literals;
 static constexpr size_t UTHREAD_FACTOR = FarVector<float>::UTHREAD_FACTOR;
-static inline size_t get_thread_count() {
-    return uthread::get_worker_count() * UTHREAD_FACTOR;
-}
+/* clang-format off */
+static inline size_t get_thread_count() { return uthread::get_worker_count() * UTHREAD_FACTOR; }
+/* clang-format on */
 typedef struct {
     int dim;         // transformer dimension
     int hidden_dim;  // for ffn layers
@@ -156,28 +156,34 @@ void malloc_run_state(RunState* s, Config* p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
-    std::cout << "x size: " << static_cast<double>(x_mem_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "xb size: " << static_cast<double>(xb_mem_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "xb2 size: " << static_cast<double>(xb2_mem_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "hb size: " << static_cast<double>(hb_mem_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "hb2 size: " << static_cast<double>(hb2_mem_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "q size: " << static_cast<double>(q_mem_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "key cache size: "
-              << static_cast<double>(key_cache_size * sizeof(float)) / 1024
-              << "K" << std::endl;
-    std::cout << "value cache size: "
-              << static_cast<double>(value_cache_size * sizeof(float)) / 1024
-              << "K" << std::endl;
-    std::cout << "att size: " << static_cast<double>(att_mem_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "logit size: " << static_cast<double>(logits_mem_size) / 1024
-              << "K" << std::endl;
+    // std::cout << "x size: " << static_cast<double>(x_mem_size) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "xb size: " << static_cast<double>(xb_mem_size) / 1024 <<
+    // "K"
+    //           << std::endl;
+    // std::cout << "xb2 size: " << static_cast<double>(xb2_mem_size) / 1024 <<
+    // "K"
+    //           << std::endl;
+    // std::cout << "hb size: " << static_cast<double>(hb_mem_size) / 1024 <<
+    // "K"
+    //           << std::endl;
+    // std::cout << "hb2 size: " << static_cast<double>(hb2_mem_size) / 1024 <<
+    // "K"
+    //           << std::endl;
+    // std::cout << "q size: " << static_cast<double>(q_mem_size) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "key cache size: "
+    //           << static_cast<double>(key_cache_size * sizeof(float)) / 1024
+    //           << "K" << std::endl;
+    // std::cout << "value cache size: "
+    //           << static_cast<double>(value_cache_size * sizeof(float)) / 1024
+    //           << "K" << std::endl;
+    // std::cout << "att size: " << static_cast<double>(att_mem_size) / 1024 <<
+    // "K"
+    //           << std::endl;
+    // std::cout << "logit size: " << static_cast<double>(logits_mem_size) /
+    // 1024
+    //           << "K" << std::endl;
 }
 
 void free_run_state(RunState* s) {
@@ -250,43 +256,45 @@ void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
     ptr += rms_final_weight_size;
     w->wcls.assign_all(shared_weights ? token_embedding_table_ptr : ptr,
                        wcls_size);
-    std::cout << "token_embedding_table_size: "
-              << static_cast<double>(token_embedding_table_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "rms_att_weight_size: "
-              << static_cast<double>(rms_att_weight_size) / 1024 << "K"
-              << std::endl;
-    std::cout << "wq_size: "
-              << static_cast<double>(wq_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
-    std::cout << "wk_size: "
-              << static_cast<double>(wk_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
-    std::cout << "wv_size: "
-              << static_cast<double>(wv_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
-    std::cout << "wo_size: "
-              << static_cast<double>(wo_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
-    std::cout << "rms_ffn_weight_size: "
-              << static_cast<double>(rms_ffn_weight_size * sizeof(float)) / 1024
-              << "K" << std::endl;
-    std::cout << "w1_size: "
-              << static_cast<double>(w1_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
-    std::cout << "w2_size: "
-              << static_cast<double>(w2_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
-    std::cout << "w3_size: "
-              << static_cast<double>(w3_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
-    std::cout << "rms_final_weight_size: "
-              << static_cast<double>(rms_final_weight_size * sizeof(float)) /
-                     1024
-              << "K" << std::endl;
-    std::cout << "wcls_size: "
-              << static_cast<double>(wcls_size * sizeof(float)) / 1024 << "K"
-              << std::endl;
+    // std::cout << "token_embedding_table_size: "
+    //           << static_cast<double>(token_embedding_table_size) / 1024 <<
+    //           "K"
+    //           << std::endl;
+    // std::cout << "rms_att_weight_size: "
+    //           << static_cast<double>(rms_att_weight_size) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "wq_size: "
+    //           << static_cast<double>(wq_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "wk_size: "
+    //           << static_cast<double>(wk_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "wv_size: "
+    //           << static_cast<double>(wv_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "wo_size: "
+    //           << static_cast<double>(wo_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "rms_ffn_weight_size: "
+    //           << static_cast<double>(rms_ffn_weight_size * sizeof(float)) /
+    //           1024
+    //           << "K" << std::endl;
+    // std::cout << "w1_size: "
+    //           << static_cast<double>(w1_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "w2_size: "
+    //           << static_cast<double>(w2_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "w3_size: "
+    //           << static_cast<double>(w3_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
+    // std::cout << "rms_final_weight_size: "
+    //           << static_cast<double>(rms_final_weight_size * sizeof(float)) /
+    //                  1024
+    //           << "K" << std::endl;
+    // std::cout << "wcls_size: "
+    //           << static_cast<double>(wcls_size * sizeof(float)) / 1024 << "K"
+    //           << std::endl;
 }
 
 void read_checkpoint(const char* checkpoint, Config* config,
@@ -456,23 +464,24 @@ void matmul(float* xout, float* x, FarVector<float>& weight_fv, size_t wstart,
                 std::min(d_start + block, static_cast<size_t>(d));
             const size_t idx_start = wstart + d_start * n;
             const size_t idx_end = wstart + d_end * n;
-            if (d_start >= d_end) {
+            if (d_start >= d_end) [[unlikely]] {
                 return;
             }
-            auto it = weight_fv.get_const_lite_iter(idx_start, scope, idx_start,
-                                                    idx_end);
-            for (size_t dd = d_start; dd < d_end; dd++) {
-                float val = 0.0f;
-                for (size_t j = 0; j < n; j++, it.next(scope)) {
-                    val += *it * x[j];
-                }
-                xout[dd] = val;
-            }
-            // use this when all local
-            // for (size_t dd = d_start, idx = idx_start; dd < d_end;
-            //      dd++, idx += n) {
-            //     xout[dd] = weight_fv.vecmul(x, n, idx, scope);
+            // auto it = weight_fv.get_const_lite_iter(idx_start, scope,
+            // idx_start,
+            //                                         idx_end);
+            // for (size_t dd = d_start; dd < d_end; dd++) {
+            //     float val = 0.0f;
+            //     for (size_t j = 0; j < n; j++, it.next(scope)) {
+            //         val += *it * x[j];
+            //     }
+            //     xout[dd] = val;
             // }
+            // use this when all local
+            for (size_t dd = d_start, idx = idx_start; dd < d_end;
+                 dd++, idx += n) {
+                xout[dd] = weight_fv.vecmul(x, n, idx, scope);
+            }
             // printf("inner avg time: %d\n", time / (d_end - d_start));
         });
     // auto end = get_cycles();
@@ -496,6 +505,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
+    // std::cout << "dim = " << dim << std::endl;
     w->token_embedding_table.copy_to_local(x, token * dim, dim);
 
     // forward all the layers
@@ -568,7 +578,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             const size_t h_start = i * block;
             const size_t h_end =
                 std::min(h_start + block, static_cast<size_t>(p->n_heads));
-            if (h_start >= h_end) {
+            if (h_start >= h_end) [[unlikely]] {
                 return;
             }
             for (size_t h = h_start; h < h_end; h++) {
@@ -1322,15 +1332,15 @@ void error_usage(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     Configure config;
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    for (int c = 24; c < 24 + 16; c++) {
-        CPU_SET(c, &mask);
-    }
-    if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {
-        perror("sched failed!\n");
-        exit(EXIT_FAILURE);
-    }
+    // cpu_set_t mask;
+    // CPU_ZERO(&mask);
+    // for (int c = 24; c < 24 + 16; c++) {
+    //     CPU_SET(c, &mask);
+    // }
+    // if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {
+    //     perror("sched failed!\n");
+    //     exit(EXIT_FAILURE);
+    // }
 #ifdef STANDALONE
     constexpr size_t FAR_ARGC = 0;
     config.server_addr = "127.0.0.1";
@@ -1407,11 +1417,11 @@ int main(int argc, char* argv[]) {
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps < 0) steps = 0;
-    std::cout << "llama init: " << std::endl;
-    std::cout << "client buffer size: "
-              << static_cast<double>(config.client_buffer_size) / (1 << 30)
-              << "G" << std::endl;
-    std::cout << "core count: " << config.max_thread_cnt << std::endl;
+    // std::cout << "llama init: " << std::endl;
+    // std::cout << "client buffer size: "
+    //           << static_cast<double>(config.client_buffer_size) / (1 << 30)
+    //           << "G" << std::endl;
+    // std::cout << "core count: " << config.max_thread_cnt << std::endl;
     FarLib::runtime_init(config);
     FarLib::perf_init();
     // build the Transformer via the model .bin file
@@ -1431,8 +1441,8 @@ int main(int argc, char* argv[]) {
 
     // run!
     auto start = get_cycles();
-    FarLib::profile::beehive_profile([&] {
-        FarLib::perf_profile([&] {
+    FarLib::perf_profile([&] {
+        FarLib::profile::beehive_profile([&] {
             if (strcmp(mode, "generate") == 0) {
                 generate(&transformer, &tokenizer, &sampler, prompt, steps);
             } else if (strcmp(mode, "chat") == 0) {
@@ -1442,11 +1452,12 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "unknown mode: %s\n", mode);
                 error_usage(argc, argv);
             }
-        }).print();
-    });
+        });
+    }).print();
     auto end = get_cycles();
-    std::cout << "wall time: " << static_cast<double>(end - start) / 2.8 / 1e3
-              << " us" << std::endl;
+    // std::cout << "wall time: " << static_cast<double>(end - start) / 2.8 /
+    // 1e3
+    //           << " us" << std::endl;
     profile::print_profile_data();
     // memory and file handles cleanup
     free_sampler(&sampler);
